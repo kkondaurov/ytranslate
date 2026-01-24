@@ -1,0 +1,22 @@
+[project]
+name = "ytranslate"
+version = "0.1.0"
+description = "Translate YouTube transcripts into a target language and structure as a conversation."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "openai>=1.40.0",
+  "requests>=2.31.0",
+  "youtube-transcript-api>=0.6.2",
+  "python-docx>=1.1.2",
+]
+
+[project.scripts]
+ytranslate = "ytranslate:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["ytranslate"]
