@@ -239,6 +239,13 @@ def build_system_prompt() -> str:
         "Produce idiomatic, natural-sounding language. You may lightly paraphrase for fluency, "
         "but stay as close to the original as possible. "
         "Preserve the tone of the conversation (serious, friendly, banter, etc.). "
+        "Translate English loanwords and jargon into natural target-language phrasing. "
+        "Do not leave untranslated/transliterated English terms (for example, avoid outputs like 'дисрапт'). "
+        "Before finalizing, self-check that no English business/technical phrase is left unexplained in the target language. "
+        "Translate inline explanations and side remarks fully, including quoted definitions by other speakers. "
+        "If no exact equivalent exists, use a concise explanatory phrase in brackets on first mention, "
+        "then use a consistent idiomatic term afterward. "
+        "For acronyms, keep the acronym where helpful but translate the expanded meaning into the target language. "
         "Use concise speaker labels (e.g., first name or role like 'Host', 'Guest'). "
         "Provide full speaker names and titles for the speaker list, but keep per-turn labels short. "
         "Do not repeat full titles in every turn; keep labels short and consistent. "
@@ -246,6 +253,24 @@ def build_system_prompt() -> str:
         "If the transcript includes non-speech cues (e.g., [music]), omit those. "
         "Keep the original order of the conversation. "
         "Return only JSON that matches the provided schema."
+    )
+
+
+def build_target_terminology_guidance(target_language: str) -> str:
+    target_norm = (target_language or "").strip().lower()
+    if "russian" in target_norm or "рус" in target_norm:
+        return (
+            "Terminology requirements for Russian:\n"
+            "- Do not leave English phrases like 'net dollar retention', 'value prop', 'foundation models' untranslated.\n"
+            "- Translate term definitions fully (example: 'remaining performance obligations' must be in Russian).\n"
+            "- If keeping an acronym (ARR/NDR/RPO/AGI), translate the expanded meaning into Russian on first mention.\n"
+            "- If there is no exact term, use a short explanatory bracket after an idiomatic Russian phrasing.\n"
+        )
+    return (
+        "Terminology requirements:\n"
+        "- Do not leave specialized English phrases untranslated in the target language.\n"
+        "- If keeping acronyms, translate their expanded meaning on first mention.\n"
+        "- If there is no exact equivalent, use a concise explanatory bracket.\n"
     )
 
 
@@ -262,10 +287,16 @@ def build_user_prompt(
     if known_speakers:
         speaker_lines = []
         for speaker in known_speakers:
-            speaker_lines.append(f"- {speaker.get('id')}: {speaker.get('label')}")
+            label_short = speaker.get("label_short") or speaker.get("id")
+            label_full = speaker.get("label_full")
+            if label_full:
+                speaker_lines.append(f"- {speaker.get('id')}: {label_short} ({label_full})")
+            else:
+                speaker_lines.append(f"- {speaker.get('id')}: {label_short}")
         speaker_block = "Known speakers (reuse these IDs if they match):\n" + "\n".join(speaker_lines)
 
     source_hint = f"Source language hint: {source_language_hint}\n" if source_language_hint else ""
+    terminology_guidance = build_target_terminology_guidance(target_language)
 
     return (
         f"Video URL: {url}\n"
@@ -274,6 +305,7 @@ def build_user_prompt(
         f"Target language: {target_language}\n"
         f"{source_hint}"
         f"{speaker_block}\n"
+        f"{terminology_guidance}\n"
         "Transcript (ordered lines):\n"
         f"{transcript_text}"
     )
