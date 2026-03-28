@@ -32,21 +32,40 @@ Or with uv:
 uv run ytranslate "https://www.youtube.com/watch?v=VIDEO_ID" "French"
 ```
 
+Generate PDF in addition to DOCX:
+```bash
+python ytranslate.py "https://www.youtube.com/watch?v=VIDEO_ID" "French" --pdf
+```
+
+PDF output uses one of:
+- LibreOffice CLI (`soffice` or `libreoffice`)
+- or `docx2pdf` (`pip install docx2pdf`)
+
 DOCX test without calling external APIs:
 ```bash
-uv run ytranslate "https://www.youtube.com/watch?v=VIDEO_ID" "French" --docx-test
+python ytranslate.py "https://www.youtube.com/watch?v=VIDEO_ID" "French" --docx-test
+```
+
+DOCX test + PDF (if converter is available):
+```bash
+python ytranslate.py "https://www.youtube.com/watch?v=VIDEO_ID" "French" --docx-test --pdf
 ```
 
 You can also put your keys in a local `.env` file in the project root:
 ```bash
 OPENAI_API_KEY=...
 YOUTUBE_API_KEY=...
-OPENAI_MODEL=gpt-5.2
+OPENAI_MODEL=gpt-5.4
 ```
 
 The output is saved to `translations/` as:
 ```
 <video-title>--<target-language>.docx
+```
+
+With `--pdf`, an additional file is generated:
+```
+<video-title>--<target-language>.pdf
 ```
 
 ## YouTube API key
@@ -64,3 +83,4 @@ export YOUTUBE_API_KEY=\"...\"
 - Transcript retrieval uses an unofficial endpoint via `youtube-transcript-api`. Some videos do not expose transcripts or may block these requests.
 - Metadata (title/description) is fetched via the official YouTube Data API to help infer speakers.
 - Output is a DOCX file for easy editing in Google Docs.
+- On macOS, successful completion sends a desktop notification (no configuration required).

@@ -4,7 +4,9 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
+import subprocess
 import time
 import unicodedata
 import inspect
@@ -21,7 +23,7 @@ from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisable
 
 
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
-DEFAULT_MODEL = "gpt-5.2"
+DEFAULT_MODEL = "gpt-5.4"
 DOCX_FONT_NAME = "Arial"
 DOCX_FONT_SIZE = Pt(13)
 DOCX_HEADING_FONT_SIZE = Pt(16)
@@ -40,6 +42,11 @@ def parse_args() -> argparse.Namespace:
         "--docx-test",
         action="store_true",
         help="Generate a sample DOCX without calling external APIs",
+    )
+    parser.add_argument(
+        "--pdf",
+        action="store_true",
+        help="Also generate PDF from the DOCX output",
     )
     return parser.parse_args()
 
@@ -660,6 +667,90 @@ def render_docx(
 
     doc.save(output_path)
 
+
+def convert_docx_to_pdf(docx_path: str) -> str:
+    output_dir = os.path.dirname(docx_path) or os.getcwd()
+    base_name = os.path.splitext(os.path.basename(docx_path))[0]
+    expected_pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
+
+    candidate_libreoffice_paths = [
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice.bin",
+    ]
+
+    converters = [
+        (shutil.which("soffice"), [
+            "soffice",
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            output_dir,
+            docx_path,
+        ]),
+        (next((p for p in candidate_libreoffice_paths if os.access(p, os.X_OK)), None), [
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            output_dir,
+            docx_path,
+        ]),
+        (shutil.which("libreoffice"), [
+            "libreoffice",
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            output_dir,
+            docx_path,
+        ]),
+    ]
+
+    for exe, cmd in converters:
+        if not exe:
+            continue
+        result = subprocess.run(
+            cmd,
+            cwd=output_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and os.path.exists(expected_pdf_path):
+            return expected_pdf_path
+
+    try:
+        from docx2pdf import convert
+    except Exception:
+        raise RuntimeError(
+            "PDF conversion is unavailable. Install one of:\n"
+            "- LibreOffice (soffice/libreoffice in PATH, or a standard macOS install at /Applications/LibreOffice.app), or\n"
+            "- Python package docx2pdf (pip install docx2pdf)."
+        )
+
+    convert(docx_path, expected_pdf_path)
+    if not os.path.exists(expected_pdf_path):
+        raise RuntimeError("docx2pdf did not generate the expected PDF file.")
+    return expected_pdf_path
+
+
+def send_completion_notification(message: str, title: str = "ytranslate") -> None:
+    safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
+    safe_message = message.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'display notification "{safe_message}" with title "{safe_title}"'
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        print(f"Failed to send macOS notification: {exc}", file=sys.stderr)
+
 def sample_docx_payload(target_language: str) -> Dict[str, Any]:
     return {
         "title_translated": f"Пример перевода ({target_language})",
@@ -708,6 +799,18 @@ def main() -> int:
             output_path,
         )
         print(f"Saved sample DOCX to {output_path}")
+        output_files = [output_path]
+        if args.pdf:
+            try:
+                pdf_path = convert_docx_to_pdf(output_path)
+                print(f"Saved sample PDF to {pdf_path}")
+                output_files.append(pdf_path)
+            except Exception as exc:
+                print(f"Failed to generate sample PDF: {exc}", file=sys.stderr)
+                return 1
+        send_completion_notification(
+            "Sample conversion finished: " + ", ".join(os.path.basename(p) for p in output_files)
+        )
         return 0
 
     openai_key = os.getenv("OPENAI_API_KEY")
@@ -786,8 +889,21 @@ def main() -> int:
         result.get("turns", []),
         output_path,
     )
+    if args.pdf:
+        try:
+            pdf_path = convert_docx_to_pdf(output_path)
+            print(f"Saved translated transcript PDF to {pdf_path}")
+            output_files = [output_path, pdf_path]
+        except Exception as exc:
+            print(f"Failed to generate transcript PDF: {exc}", file=sys.stderr)
+            return 1
+    else:
+        output_files = [output_path]
 
     print(f"Saved translated transcript to {output_path}")
+    send_completion_notification(
+        "Translation completed: " + ", ".join(os.path.basename(p) for p in output_files)
+    )
     return 0
 
 
