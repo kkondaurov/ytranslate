@@ -22,6 +22,9 @@ from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisable
 
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 DEFAULT_MODEL = "gpt-5.2"
+DOCX_FONT_NAME = "Arial"
+DOCX_FONT_SIZE = Pt(13)
+DOCX_HEADING_FONT_SIZE = Pt(16)
 
 
 def parse_args() -> argparse.Namespace:
@@ -626,6 +629,12 @@ def render_docx(
     output_path: str,
 ) -> None:
     doc = Document()
+    doc.styles["Normal"].font.name = DOCX_FONT_NAME
+    doc.styles["Normal"].font.size = DOCX_FONT_SIZE
+    doc.styles["List Bullet"].font.name = DOCX_FONT_NAME
+    doc.styles["List Bullet"].font.size = DOCX_FONT_SIZE
+    doc.styles["Heading 1"].font.name = DOCX_FONT_NAME
+    doc.styles["Heading 1"].font.size = DOCX_HEADING_FONT_SIZE
     doc.add_heading(title_translated.strip() or "Translated Transcript", level=1)
 
     if speakers:
