@@ -57,13 +57,7 @@ function isWatchPage() {
 }
 
 function ensureStyles() {
-  if (document.getElementById(STYLE_ID)) {
-    return;
-  }
-
-  const style = document.createElement("style");
-  style.id = STYLE_ID;
-  style.textContent = `
+  const cssText = `
     #${BUTTON_HOST_ID} {
       display: inline-flex;
       margin-right: 8px;
@@ -71,6 +65,20 @@ function ensureStyles() {
 
     #${BUTTON_ID} {
       min-width: auto;
+    }
+
+    #${BUTTON_ID} .ytranslate-button-icon {
+      display: inline-flex;
+      width: 24px;
+      height: 24px;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #${BUTTON_ID} .ytranslate-button-icon svg {
+      display: block;
+      width: 24px;
+      height: 24px;
     }
 
     #${BUTTON_ID} .yt-spec-button-shape-next__button-text-content {
@@ -105,7 +113,14 @@ function ensureStyles() {
       transform: translateY(0);
     }
   `;
-  document.documentElement.appendChild(style);
+
+  let style = document.getElementById(STYLE_ID);
+  if (!style) {
+    style = document.createElement("style");
+    style.id = STYLE_ID;
+    document.documentElement.appendChild(style);
+  }
+  style.textContent = cssText;
 }
 
 function ensureToastRoot() {
@@ -169,41 +184,33 @@ function getButtonsContainer() {
 
 function buildPdfIconMarkup() {
   return `
-    <svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 0 24 24" width="24" focusable="false" aria-hidden="true" style="pointer-events: none; display: inherit; width: 100%; height: 100%;">
-      <path d="M6 2h8.5L20 7.5V19a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm7 1.5V8h4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
-      <path d="M7.2 16.8v-4.6h1.92c1.19 0 1.9.66 1.9 1.73 0 1.12-.78 1.8-2.02 1.8h-.8v1.05h-1Z" fill="currentColor"></path>
-      <path d="M12.1 16.8v-4.6h1.82c1.55 0 2.56.87 2.56 2.28 0 1.42-1.01 2.32-2.56 2.32H12.1Z" fill="currentColor"></path>
-      <path d="M17.55 16.8v-4.6h3.05v.85h-2.05v.99h1.86v.83h-1.86v1.93h-1Z" fill="currentColor"></path>
+    <svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 0 24 24" width="24" focusable="false" aria-hidden="true" fill="none" style="pointer-events: none; display: inherit; width: 100%; height: 100%;">
+      <path d="M7 3.5h7.2L18.5 7.8v10.7A1.5 1.5 0 0 1 17 20H7a1.5 1.5 0 0 1-1.5-1.5V5A1.5 1.5 0 0 1 7 3.5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"></path>
+      <path d="M14.2 3.5V7.8h4.3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"></path>
+      <circle cx="10.2" cy="12" r=".85" fill="currentColor"></circle>
+      <circle cx="13.8" cy="12" r=".85" fill="currentColor"></circle>
+      <path d="M9.7 15c.55.55 1.3.85 2.3.85s1.75-.3 2.3-.85" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round"></path>
     </svg>
   `;
 }
 
 function createPdfButton(container) {
-  const shareButton = container.querySelector(
-    "yt-button-view-model button, button[aria-label='Share'], button[aria-label^='Share']"
-  );
-
-  let button;
-  if (shareButton) {
-    button = shareButton.cloneNode(true);
-  } else {
-    button = document.createElement("button");
-    button.className = "yt-spec-button-shape-next yt-spec-button-shape-next--tonal yt-spec-button-shape-next--mono yt-spec-button-shape-next--size-m yt-spec-button-shape-next--icon-leading yt-spec-button-shape-next--enable-backdrop-filter-experiment";
-    button.innerHTML = `
-      <div aria-hidden="true" class="yt-spec-button-shape-next__icon"></div>
-      <div class="yt-spec-button-shape-next__button-text-content">PDF</div>
-    `;
-  }
+  const button = document.createElement("button");
+  button.className =
+    "yt-spec-button-shape-next yt-spec-button-shape-next--tonal yt-spec-button-shape-next--mono yt-spec-button-shape-next--size-m yt-spec-button-shape-next--icon-leading yt-spec-button-shape-next--enable-backdrop-filter-experiment";
+  button.innerHTML = `
+    <div aria-hidden="true" class="yt-spec-button-shape-next__icon ytranslate-button-icon">${buildPdfIconMarkup()}</div>
+    <div class="yt-spec-button-shape-next__button-text-content">PDF</div>
+    <yt-touch-feedback-shape aria-hidden="true" class="yt-spec-touch-feedback-shape yt-spec-touch-feedback-shape--touch-response">
+      <div class="yt-spec-touch-feedback-shape__stroke"></div>
+      <div class="yt-spec-touch-feedback-shape__fill"></div>
+    </yt-touch-feedback-shape>
+  `;
 
   button.id = BUTTON_ID;
   button.type = "button";
   button.setAttribute("aria-label", "Generate Russian PDF transcript");
   button.removeAttribute("aria-pressed");
-
-  const icon = button.querySelector(".yt-spec-button-shape-next__icon");
-  if (icon) {
-    icon.innerHTML = buildPdfIconMarkup();
-  }
 
   const text = button.querySelector(".yt-spec-button-shape-next__button-text-content");
   if (text) {
@@ -277,10 +284,6 @@ function injectButton() {
 
   const container = getButtonsContainer();
   if (!container) {
-    return;
-  }
-
-  if (existingHost && existingHost.parentElement === container) {
     return;
   }
 
