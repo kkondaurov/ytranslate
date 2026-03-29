@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "YTranslate PDF",
+  "version": "0.1.0",
+  "description": "Queue YouTube videos for local PDF transcript generation.",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*",
+    "http://localhost:8765/*"
+  ]
+}

@@ -10,7 +10,7 @@ import subprocess
 import time
 import unicodedata
 import inspect
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -23,7 +23,10 @@ from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisable
 
 
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
 DEFAULT_MODEL = "gpt-5.4"
+DEFAULT_TARGET_LANGUAGE = "Russian"
 DOCX_FONT_NAME = "Arial"
 DOCX_FONT_SIZE = Pt(13)
 DOCX_HEADING_FONT_SIZE = Pt(16)
@@ -38,7 +41,11 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("url", help="YouTube video URL")
-    parser.add_argument("target_language", help="Target language (e.g., French)")
+    parser.add_argument(
+        "target_language",
+        nargs="?",
+        help="Target language (defaults to DEFAULT_TARGET_LANGUAGE or Russian)",
+    )
     parser.add_argument(
         "--docx-test",
         action="store_true",
@@ -62,6 +69,15 @@ def load_dotenv(path: str) -> None:
                     os.environ[key] = value
     except OSError:
         return
+
+
+def load_project_env() -> None:
+    load_dotenv(ENV_PATH)
+
+
+def resolve_target_language(target_language: Optional[str]) -> str:
+    value = (target_language or os.getenv("DEFAULT_TARGET_LANGUAGE") or DEFAULT_TARGET_LANGUAGE).strip()
+    return value or DEFAULT_TARGET_LANGUAGE
 
 
 def extract_video_id(url: str) -> Optional[str]:
@@ -94,6 +110,13 @@ def extract_video_id(url: str) -> Optional[str]:
             return parts[2] if len(parts) > 2 else None
 
     return None
+
+
+def canonicalize_youtube_url(url: str) -> Optional[str]:
+    video_id = extract_video_id(url)
+    if not video_id:
+        return None
+    return f"https://youtu.be/{video_id}"
 
 
 def fetch_video_metadata(video_id: str, api_key: str) -> Dict[str, Any]:
@@ -775,106 +798,107 @@ def sample_docx_payload(target_language: str) -> Dict[str, Any]:
     }
 
 
-def main() -> int:
-    args = parse_args()
-    url = args.url
-    target_language = args.target_language
+def run_sample_generation(
+    target_language: Optional[str],
+    log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    resolved_target_language = resolve_target_language(target_language)
+    output_dir = OUTPUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+    filename = f"sample--{sanitize_filename(resolved_target_language)}.docx"
+    output_path = os.path.join(output_dir, filename)
+    sample = sample_docx_payload(resolved_target_language)
+    render_docx(
+        sample.get("title_translated", "Sample"),
+        sample.get("speakers", []),
+        sample.get("turns", []),
+        output_path,
+    )
+    log(f"Saved sample DOCX to {output_path}")
+    try:
+        pdf_path = convert_docx_to_pdf(output_path)
+        log(f"Saved sample PDF to {pdf_path}")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to generate sample PDF: {exc}") from exc
+    output_files = [output_path, pdf_path]
+    send_completion_notification(
+        "Sample conversion finished: " + ", ".join(os.path.basename(p) for p in output_files)
+    )
+    return {
+        "target_language": resolved_target_language,
+        "docx_path": output_path,
+        "pdf_path": pdf_path,
+        "output_files": output_files,
+    }
 
-    load_dotenv(os.path.join(os.getcwd(), ".env"))
 
-    if args.docx_test:
-        output_dir = OUTPUT_DIR
-        os.makedirs(output_dir, exist_ok=True)
-        filename = f"sample--{sanitize_filename(target_language)}.docx"
-        output_path = os.path.join(output_dir, filename)
-        sample = sample_docx_payload(target_language)
-        render_docx(
-            sample.get("title_translated", "Sample"),
-            sample.get("speakers", []),
-            sample.get("turns", []),
-            output_path,
-        )
-        print(f"Saved sample DOCX to {output_path}")
-        try:
-            pdf_path = convert_docx_to_pdf(output_path)
-            print(f"Saved sample PDF to {pdf_path}")
-            output_files = [output_path, pdf_path]
-        except Exception as exc:
-            print(f"Failed to generate sample PDF: {exc}", file=sys.stderr)
-            return 1
-        send_completion_notification(
-            "Sample conversion finished: " + ", ".join(os.path.basename(p) for p in output_files)
-        )
-        return 0
+def run_translation_job(
+    url: str,
+    target_language: Optional[str] = None,
+    log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    load_project_env()
+    canonical_url = canonicalize_youtube_url(url)
+    if not canonical_url:
+        raise RuntimeError("Could not extract video ID from URL")
 
+    resolved_target_language = resolve_target_language(target_language)
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
-        print("OPENAI_API_KEY is not set", file=sys.stderr)
-        return 1
+        raise RuntimeError("OPENAI_API_KEY is not set")
 
     youtube_key = os.getenv("YOUTUBE_API_KEY")
     if not youtube_key:
-        print("YOUTUBE_API_KEY is not set", file=sys.stderr)
-        return 1
+        raise RuntimeError("YOUTUBE_API_KEY is not set")
 
-    video_id = extract_video_id(url)
+    video_id = extract_video_id(canonical_url)
     if not video_id:
-        print("Could not extract video ID from URL", file=sys.stderr)
-        return 1
+        raise RuntimeError("Could not extract video ID from URL")
 
-    print("Fetching metadata...")
-    try:
-        metadata = fetch_video_metadata(video_id, youtube_key)
-    except Exception as exc:
-        print(f"Failed to fetch video metadata: {exc}", file=sys.stderr)
-        return 1
+    log(f"Received URL: {canonical_url}")
+    log(f"Target language: {resolved_target_language}")
+
+    log("Fetching metadata...")
+    metadata = fetch_video_metadata(video_id, youtube_key)
     title = metadata.get("title") or "Untitled"
     description = metadata.get("description", "")
     source_language_hint = metadata.get("defaultAudioLanguage") or metadata.get("defaultLanguage")
 
-    print("Fetching transcript...")
+    log("Fetching transcript...")
     preferred_langs = [
         metadata.get("defaultAudioLanguage"),
         metadata.get("defaultLanguage"),
     ]
-
     try:
         transcript_info = fetch_transcript(video_id, preferred_langs)
-    except TranscriptsDisabled:
-        print("Transcripts are disabled for this video.", file=sys.stderr)
-        return 1
-    except NoTranscriptFound:
-        print("No transcript found for this video.", file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(f"Failed to fetch transcript: {exc}", file=sys.stderr)
-        return 1
+    except TranscriptsDisabled as exc:
+        raise RuntimeError("Transcripts are disabled for this video.") from exc
+    except NoTranscriptFound as exc:
+        raise RuntimeError("No transcript found for this video.") from exc
 
     segments = normalize_segments(transcript_info.get("segments", []))
     if not segments:
-        print("Transcript was empty after normalization.", file=sys.stderr)
-        return 1
+        raise RuntimeError("Transcript was empty after normalization.")
 
-    print("Translating and structuring transcript (this may take a while)...")
+    log("Translating and structuring transcript (this may take a while)...")
     client = OpenAI(api_key=openai_key)
     model = os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
 
     result = translate_transcript(
         client,
         model,
-        url,
+        canonical_url,
         title,
         description,
-        target_language,
+        resolved_target_language,
         segments,
         source_language_hint,
     )
 
     title_translated = result.get("title_translated", "").strip() or title
-
     output_dir = OUTPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
-    filename = f"{sanitize_filename(title)}--{sanitize_filename(target_language)}.docx"
+    filename = f"{sanitize_filename(title)}--{sanitize_filename(resolved_target_language)}.docx"
     output_path = os.path.join(output_dir, filename)
 
     render_docx(
@@ -883,18 +907,41 @@ def main() -> int:
         result.get("turns", []),
         output_path,
     )
+    log(f"Saved translated transcript to {output_path}")
     try:
         pdf_path = convert_docx_to_pdf(output_path)
-        print(f"Saved translated transcript PDF to {pdf_path}")
-        output_files = [output_path, pdf_path]
+        log(f"Saved translated transcript PDF to {pdf_path}")
     except Exception as exc:
-        print(f"Failed to generate transcript PDF: {exc}", file=sys.stderr)
-        return 1
+        raise RuntimeError(f"Failed to generate transcript PDF: {exc}") from exc
 
-    print(f"Saved translated transcript to {output_path}")
+    output_files = [output_path, pdf_path]
     send_completion_notification(
         "Translation completed: " + ", ".join(os.path.basename(p) for p in output_files)
     )
+    log(f"Finished generating files for {canonical_url}")
+    return {
+        "url": canonical_url,
+        "video_id": video_id,
+        "title": title,
+        "title_translated": title_translated,
+        "target_language": resolved_target_language,
+        "docx_path": output_path,
+        "pdf_path": pdf_path,
+        "output_files": output_files,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.docx_test:
+            load_project_env()
+            run_sample_generation(args.target_language)
+        else:
+            run_translation_job(args.url, args.target_language)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     return 0
 
 
