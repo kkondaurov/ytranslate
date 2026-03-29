@@ -27,6 +27,7 @@ DEFAULT_MODEL = "gpt-5.4"
 DOCX_FONT_NAME = "Arial"
 DOCX_FONT_SIZE = Pt(13)
 DOCX_HEADING_FONT_SIZE = Pt(16)
+OUTPUT_DIR = os.path.expanduser("~/Downloads")
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,11 +43,6 @@ def parse_args() -> argparse.Namespace:
         "--docx-test",
         action="store_true",
         help="Generate a sample DOCX without calling external APIs",
-    )
-    parser.add_argument(
-        "--pdf",
-        action="store_true",
-        help="Also generate PDF from the DOCX output",
     )
     return parser.parse_args()
 
@@ -787,7 +783,7 @@ def main() -> int:
     load_dotenv(os.path.join(os.getcwd(), ".env"))
 
     if args.docx_test:
-        output_dir = os.path.join(os.getcwd(), "translations")
+        output_dir = OUTPUT_DIR
         os.makedirs(output_dir, exist_ok=True)
         filename = f"sample--{sanitize_filename(target_language)}.docx"
         output_path = os.path.join(output_dir, filename)
@@ -799,15 +795,13 @@ def main() -> int:
             output_path,
         )
         print(f"Saved sample DOCX to {output_path}")
-        output_files = [output_path]
-        if args.pdf:
-            try:
-                pdf_path = convert_docx_to_pdf(output_path)
-                print(f"Saved sample PDF to {pdf_path}")
-                output_files.append(pdf_path)
-            except Exception as exc:
-                print(f"Failed to generate sample PDF: {exc}", file=sys.stderr)
-                return 1
+        try:
+            pdf_path = convert_docx_to_pdf(output_path)
+            print(f"Saved sample PDF to {pdf_path}")
+            output_files = [output_path, pdf_path]
+        except Exception as exc:
+            print(f"Failed to generate sample PDF: {exc}", file=sys.stderr)
+            return 1
         send_completion_notification(
             "Sample conversion finished: " + ", ".join(os.path.basename(p) for p in output_files)
         )
@@ -878,7 +872,7 @@ def main() -> int:
 
     title_translated = result.get("title_translated", "").strip() or title
 
-    output_dir = os.path.join(os.getcwd(), "translations")
+    output_dir = OUTPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
     filename = f"{sanitize_filename(title)}--{sanitize_filename(target_language)}.docx"
     output_path = os.path.join(output_dir, filename)
@@ -889,16 +883,13 @@ def main() -> int:
         result.get("turns", []),
         output_path,
     )
-    if args.pdf:
-        try:
-            pdf_path = convert_docx_to_pdf(output_path)
-            print(f"Saved translated transcript PDF to {pdf_path}")
-            output_files = [output_path, pdf_path]
-        except Exception as exc:
-            print(f"Failed to generate transcript PDF: {exc}", file=sys.stderr)
-            return 1
-    else:
-        output_files = [output_path]
+    try:
+        pdf_path = convert_docx_to_pdf(output_path)
+        print(f"Saved translated transcript PDF to {pdf_path}")
+        output_files = [output_path, pdf_path]
+    except Exception as exc:
+        print(f"Failed to generate transcript PDF: {exc}", file=sys.stderr)
+        return 1
 
     print(f"Saved translated transcript to {output_path}")
     send_completion_notification(

@@ -32,9 +32,9 @@ Or with uv:
 uv run ytranslate "https://www.youtube.com/watch?v=VIDEO_ID" "French"
 ```
 
-Generate PDF in addition to DOCX:
+PDF is always generated automatically:
 ```bash
-python ytranslate.py "https://www.youtube.com/watch?v=VIDEO_ID" "French" --pdf
+python ytranslate.py "https://www.youtube.com/watch?v=VIDEO_ID" "French"
 ```
 
 PDF output uses one of:
@@ -46,9 +46,9 @@ DOCX test without calling external APIs:
 python ytranslate.py "https://www.youtube.com/watch?v=VIDEO_ID" "French" --docx-test
 ```
 
-DOCX test + PDF (if converter is available):
+DOCX test (also generates PDF):
 ```bash
-python ytranslate.py "https://www.youtube.com/watch?v=VIDEO_ID" "French" --docx-test --pdf
+python ytranslate.py "https://www.youtube.com/watch?v=VIDEO_ID" "French" --docx-test
 ```
 
 You can also put your keys in a local `.env` file in the project root:
@@ -58,12 +58,12 @@ YOUTUBE_API_KEY=...
 OPENAI_MODEL=gpt-5.4
 ```
 
-The output is saved to `translations/` as:
+The output is saved to `~/Downloads/` as:
 ```
 <video-title>--<target-language>.docx
 ```
 
-With `--pdf`, an additional file is generated:
+PDF is also generated alongside it:
 ```
 <video-title>--<target-language>.pdf
 ```
