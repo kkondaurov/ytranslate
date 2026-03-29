@@ -805,7 +805,7 @@ def run_sample_generation(
     resolved_target_language = resolve_target_language(target_language)
     output_dir = OUTPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
-    filename = f"sample--{sanitize_filename(resolved_target_language)}.docx"
+    filename = "sample.docx"
     output_path = os.path.join(output_dir, filename)
     sample = sample_docx_payload(resolved_target_language)
     render_docx(
@@ -898,7 +898,7 @@ def run_translation_job(
     title_translated = result.get("title_translated", "").strip() or title
     output_dir = OUTPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
-    filename = f"{sanitize_filename(title)}--{sanitize_filename(resolved_target_language)}.docx"
+    filename = f"{sanitize_filename(title)}.docx"
     output_path = os.path.join(output_dir, filename)
 
     render_docx(

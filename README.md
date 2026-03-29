@@ -82,12 +82,12 @@ DEFAULT_TARGET_LANGUAGE=Russian
 
 The output is saved to `~/Downloads/` as:
 ```
-<video-title>--<target-language>.docx
+<video-title>.docx
 ```
 
 PDF is also generated alongside it:
 ```
-<video-title>--<target-language>.pdf
+<video-title>.pdf
 ```
 
 ## YouTube API key
