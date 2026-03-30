@@ -53,6 +53,11 @@ Override the default target language:
 python ytranslate.py "https://www.youtube.com/watch?v=VIDEO_ID" "French"
 ```
 
+Debug a run without generating DOCX/PDF:
+```bash
+python ytranslate.py "https://www.youtube.com/watch?v=VIDEO_ID" --debug
+```
+
 Or with uv:
 ```bash
 uv run ytranslate "https://www.youtube.com/watch?v=VIDEO_ID"
@@ -76,7 +81,7 @@ You can also put your keys in a local `.env` file in the project root:
 ```bash
 OPENAI_API_KEY=...
 YOUTUBE_API_KEY=...
-OPENAI_MODEL=gpt-5.4
+OPENAI_MODEL=gpt-5.4-mini
 DEFAULT_TARGET_LANGUAGE=Russian
 ```
 
@@ -89,6 +94,22 @@ PDF is also generated alongside it:
 ```
 <video-title>.pdf
 ```
+
+Debug mode writes a per-run folder under `~/Downloads/`, for example:
+```
+ytranslate-debug-<video-id>-<timestamp>-<video-title>/
+```
+
+Artifacts include:
+- `metadata.json`
+- `raw-transcript.json`
+- `normalized-transcript.md`
+- `speaker-pass-*.json`
+- `translation-pass-*.json`
+- `cleanup-pass-*.json` (when Russian cleanup runs)
+- `annotation-pass-*.json` (when Russian annotation runs)
+- `final.json`
+- `final.md`
 
 ## YouTube API key
 1) Go to Google Cloud Console and select (or create) a project.
