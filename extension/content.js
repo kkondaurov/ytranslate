@@ -1,5 +1,6 @@
 const BUTTON_HOST_ID = "ytranslate-pdf-button-host";
 const BUTTON_ID = "ytranslate-pdf-button";
+const BUTTON_RENDER_VERSION = "4";
 const STYLE_ID = "ytranslate-extension-style";
 const TOAST_ROOT_ID = "ytranslate-toast-root";
 const TOAST_ID = "ytranslate-toast";
@@ -209,6 +210,7 @@ function createPdfButton(container) {
 
   button.id = BUTTON_ID;
   button.type = "button";
+  button.dataset.renderVersion = BUTTON_RENDER_VERSION;
   button.setAttribute("aria-label", "Generate Russian PDF transcript");
   button.removeAttribute("aria-pressed");
 
@@ -284,6 +286,18 @@ function injectButton() {
 
   const container = getButtonsContainer();
   if (!container) {
+    return;
+  }
+
+  const existingButton = existingHost ? existingHost.querySelector(`#${BUTTON_ID}`) : null;
+  if (
+    existingHost &&
+    existingHost.parentElement === container &&
+    existingButton &&
+    existingButton.dataset.renderVersion === BUTTON_RENDER_VERSION
+  ) {
+    ensureStyles();
+    ensureToastRoot();
     return;
   }
 
