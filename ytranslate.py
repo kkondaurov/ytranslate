@@ -557,9 +557,15 @@ def build_speaker_attribution_system_prompt() -> str:
         "If a speaker is uncertain, use consistent labels like 'speaker_1', 'speaker_2'. "
         "Do not split a single sentence, clause, or thought across multiple speakers. "
         "Do not assign a new speaker to a dangling fragment that clearly continues the previous sentence. "
-        "Prefer fewer speaker switches over speculative speaker changes. "
+        "Prefer fewer speaker switches over speculative speaker changes, but do not over-merge distinct turns. "
         "Only switch speakers when the transcript clearly indicates a turn change. "
-        "Merge adjacent lines into coherent turns instead of many tiny fragments. "
+        "Treat each input line as a possible utterance boundary. Merge adjacent lines only when they clearly belong to the same speaker and the same thought. "
+        "Preserve clearly separate acknowledgements, interruptions, and backchannels as their own turns when they appear to come from a different speaker. "
+        "Do not merge across an obvious question-answer boundary just because the answer begins with a short acknowledgement like 'yeah', 'right', or 'exactly'. "
+        "If a line begins with markers like '>>', treat that as strong evidence of a new utterance boundary. "
+        "If one line ends with a question and the next line is a short response or acknowledgement, prefer a speaker change unless there is strong evidence otherwise. "
+        "Short responses such as 'yeah', 'no', 'right', 'good', 'fair enough', 'absolutely', 'exactly', 'I agree', 'oh no', and similar phrases often belong to the other speaker and should usually remain separate turns. "
+        "Merge adjacent lines into coherent turns only after preserving those local boundaries. "
         "Remove filler words like 'um', 'uh', and obvious stutters while preserving meaning. "
         "If the transcript includes non-speech cues like [music], omit them. "
         "Use concise per-turn labels such as a first name or role like Host or Guest. "
@@ -963,22 +969,7 @@ def attribute_speakers(
     source_language_hint: Optional[str],
     debug_sink: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    try:
-        return attribute_speakers_single_pass(
-            client,
-            model,
-            url,
-            title,
-            description,
-            segments,
-            source_language_hint,
-            debug_sink=debug_sink,
-        )
-    except Exception as exc:
-        if not (is_context_length_error(exc) or is_request_too_large_error(exc)):
-            raise
-
-    for max_chars in (80_000, 50_000, 35_000, 25_000):
+    for max_chars in (12_000, 8_000, 20_000, 35_000):
         try:
             return attribute_speakers_with_chunking(
                 client,
@@ -994,6 +985,21 @@ def attribute_speakers(
         except Exception as exc:
             if is_context_length_error(exc):
                 continue
+            raise
+
+    try:
+        return attribute_speakers_single_pass(
+            client,
+            model,
+            url,
+            title,
+            description,
+            segments,
+            source_language_hint,
+            debug_sink=debug_sink,
+        )
+    except Exception as exc:
+        if not (is_context_length_error(exc) or is_request_too_large_error(exc)):
             raise
 
     raise RuntimeError("Unable to attribute speakers within context limits")
