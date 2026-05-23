@@ -3,7 +3,7 @@
 Translate a YouTube video into a target language and structure it as a conversation.
 
 ## Requirements
-- Python 3.9+
+- Python 3.10+
 - Google Chrome
 - OpenAI API key (`OPENAI_API_KEY`)
 - YouTube Data API key (`YOUTUBE_API_KEY`)
