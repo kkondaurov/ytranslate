@@ -314,5 +314,111 @@ class RunTranslationJobSourceChoiceTests(unittest.TestCase):
         self.assertEqual(rendered_speakers[0]["label_short"], "Host")
 
 
+class TurnTextAlignmentTests(unittest.TestCase):
+    def test_align_turn_texts_by_returned_turn_index(self):
+        returned_turns = [
+            {"turn_index": 2, "text_translated": "second"},
+            {"turn_index": 1, "text_translated": "first"},
+        ]
+
+        self.assertEqual(
+            ytranslate.align_turn_texts_by_index(returned_turns, 2, "translation"),
+            ["first", "second"],
+        )
+
+    def test_align_turn_texts_rejects_missing_turn_index(self):
+        returned_turns = [
+            {"turn_index": 1, "text_translated": "first"},
+            {"text_translated": "second"},
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "missing turn_index"):
+            ytranslate.align_turn_texts_by_index(returned_turns, 2, "translation")
+
+    def test_translate_attributed_turns_preserves_speaker_ids_when_model_reorders_results(self):
+        turns = [
+            {"speaker_id": "speaker_a", "text_source": "Alpha."},
+            {"speaker_id": "speaker_b", "text_source": "Beta."},
+        ]
+        speakers = [
+            {"id": "speaker_a", "label_short": "A", "label_full": "A"},
+            {"id": "speaker_b", "label_short": "B", "label_full": "B"},
+        ]
+        result_from_model = {
+            "title_translated": "Title",
+            "turns": [
+                {"turn_index": 2, "text_translated": "Бета."},
+                {"turn_index": 1, "text_translated": "Альфа."},
+            ],
+        }
+
+        with patch.object(ytranslate, "translate_turn_chunk", return_value=result_from_model):
+            result = ytranslate.translate_attributed_turns(
+                client=Mock(),
+                model="model",
+                url="https://youtu.be/test",
+                title="Title",
+                description="",
+                target_language="Russian",
+                speakers=speakers,
+                turns=turns,
+                source_language_hint=None,
+            )
+
+        self.assertEqual(
+            result["turns"],
+            [
+                {"speaker_id": "speaker_a", "text_translated": "Альфа."},
+                {"speaker_id": "speaker_b", "text_translated": "Бета."},
+            ],
+        )
+
+    def test_cleanup_russian_turn_chunk_aligns_returned_texts_by_turn_index(self):
+        turns = [
+            {"speaker_id": "speaker_a", "text_translated": "первый"},
+            {"speaker_id": "speaker_b", "text_translated": "второй"},
+        ]
+        result_from_model = {
+            "turns": [
+                {"turn_index": 2, "text_translated": "второй чистый"},
+                {"turn_index": 1, "text_translated": "первый чистый"},
+            ],
+        }
+
+        with patch.object(ytranslate, "call_openai_with_retry", return_value=result_from_model):
+            self.assertEqual(
+                ytranslate.cleanup_russian_turn_chunk(
+                    client=Mock(),
+                    model="model",
+                    title_translated="Заголовок",
+                    turns=turns,
+                ),
+                ["первый чистый", "второй чистый"],
+            )
+
+    def test_annotate_russian_turn_chunk_aligns_returned_texts_by_turn_index(self):
+        turns = [
+            {"speaker_id": "speaker_a", "text_translated": "первый"},
+            {"speaker_id": "speaker_b", "text_translated": "второй"},
+        ]
+        result_from_model = {
+            "turns": [
+                {"turn_index": 2, "text_translated": "второй с пояснением"},
+                {"turn_index": 1, "text_translated": "первый с пояснением"},
+            ],
+        }
+
+        with patch.object(ytranslate, "call_openai_with_retry", return_value=result_from_model):
+            self.assertEqual(
+                ytranslate.annotate_russian_turn_chunk(
+                    client=Mock(),
+                    model="model",
+                    title_translated="Заголовок",
+                    turns=turns,
+                ),
+                ["первый с пояснением", "второй с пояснением"],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
