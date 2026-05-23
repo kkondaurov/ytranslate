@@ -46,6 +46,7 @@ DOCX_FONT_SIZE = Pt(13)
 DOCX_HEADING_FONT_SIZE = Pt(16)
 OUTPUT_DIR = os.path.expanduser("~/Downloads")
 CACHE_DIR = os.path.expanduser("~/Library/Caches/ytranslate")
+SPEAKER_OVERRIDES_FILENAME = "speaker-overrides.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -373,6 +374,10 @@ def get_video_cache_dir(video_id: str) -> str:
     cache_dir = os.path.join(CACHE_DIR, sanitize_filename(video_id))
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
+
+
+def get_speaker_mapping_override_path(video_id: str) -> str:
+    return os.path.join(get_video_cache_dir(video_id), SPEAKER_OVERRIDES_FILENAME)
 
 
 def download_youtube_audio(url: str, video_id: str, log: Callable[[str], None]) -> str:
@@ -750,6 +755,128 @@ def assign_global_speakers_for_diarized_segments(
     if debug_sink is not None:
         debug_sink.append({"profiles": profiles, "result": result})
     return result
+
+
+def speaker_label_lookup_key(label: str) -> str:
+    return re.sub(r"\s+", " ", label.strip().lower())
+
+
+def resolve_override_speaker_id(
+    speakers_by_id: Dict[str, Dict[str, str]],
+    override: Dict[str, Any],
+) -> str:
+    speaker_id = str(override.get("speaker_id") or "").strip()
+    if speaker_id:
+        return speaker_id
+
+    label = str(
+        override.get("speaker_label")
+        or override.get("label_short")
+        or override.get("label_full")
+        or ""
+    ).strip()
+    if not label:
+        raise RuntimeError("Speaker override must include speaker_id or speaker_label")
+
+    label_key = speaker_label_lookup_key(label)
+    for existing_id, speaker in speakers_by_id.items():
+        labels = [
+            existing_id,
+            speaker.get("label_short", ""),
+            speaker.get("label_full", ""),
+        ]
+        if any(speaker_label_lookup_key(item) == label_key for item in labels if item):
+            return existing_id
+
+    speaker_id = speaker_id_from_label(label)
+    speakers_by_id[speaker_id] = {
+        "id": speaker_id,
+        "label_short": label,
+        "label_full": str(override.get("label_full") or label),
+    }
+    return speaker_id
+
+
+def apply_speaker_mapping_overrides(
+    speaker_mapping: Dict[str, Any],
+    overrides: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not overrides:
+        return speaker_mapping
+
+    speakers_by_id = {
+        str(speaker.get("id")): dict(speaker)
+        for speaker in speaker_mapping.get("speakers", [])
+        if speaker.get("id")
+    }
+    for speaker in overrides.get("speakers", []):
+        speaker_id = str(speaker.get("id") or "").strip()
+        if not speaker_id:
+            continue
+        speakers_by_id[speaker_id] = {
+            "id": speaker_id,
+            "label_short": str(speaker.get("label_short") or speaker_id),
+            "label_full": str(speaker.get("label_full") or speaker.get("label_short") or speaker_id),
+        }
+
+    local_speakers = [
+        {
+            "chunk_index": int(item.get("chunk_index") or 0),
+            "local_speaker": str(item.get("local_speaker") or "speaker"),
+            "speaker_id": str(item.get("speaker_id") or ""),
+        }
+        for item in speaker_mapping.get("local_speakers", [])
+    ]
+    local_by_key = {
+        (item["chunk_index"], item["local_speaker"]): item
+        for item in local_speakers
+    }
+
+    for override in overrides.get("local_speakers", []):
+        chunk_index = int(override.get("chunk_index") or 0)
+        local_speaker = str(override.get("local_speaker") or "").strip()
+        if not chunk_index or not local_speaker:
+            raise RuntimeError("Speaker override must include chunk_index and local_speaker")
+        speaker_id = resolve_override_speaker_id(speakers_by_id, override)
+        key = (chunk_index, local_speaker)
+        if key in local_by_key:
+            local_by_key[key]["speaker_id"] = speaker_id
+        else:
+            item = {
+                "chunk_index": chunk_index,
+                "local_speaker": local_speaker,
+                "speaker_id": speaker_id,
+            }
+            local_speakers.append(item)
+            local_by_key[key] = item
+
+    return {
+        "speakers": list(speakers_by_id.values()),
+        "local_speakers": local_speakers,
+    }
+
+
+def load_speaker_mapping_overrides(
+    video_id: str,
+    extra_paths: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    paths = [get_speaker_mapping_override_path(video_id)]
+    if extra_paths:
+        paths.extend(extra_paths)
+
+    combined: Dict[str, List[Dict[str, Any]]] = {"speakers": [], "local_speakers": []}
+    seen_paths = set()
+    found = False
+    for path in paths:
+        if not path or path in seen_paths or not os.path.exists(path):
+            continue
+        seen_paths.add(path)
+        data = read_json_file(path)
+        combined["speakers"].extend(data.get("speakers", []))
+        combined["local_speakers"].extend(data.get("local_speakers", []))
+        found = True
+
+    return combined if found else None
 
 
 def attributed_turns_from_diarized_segments(
@@ -2465,6 +2592,10 @@ def run_translation_job(
             source_language_hint,
             debug_sink=speaker_pass_debug if debug else None,
         )
+        speaker_overrides = load_speaker_mapping_overrides(video_id)
+        if speaker_overrides:
+            log("Applying speaker mapping overrides...")
+            speaker_mapping = apply_speaker_mapping_overrides(speaker_mapping, speaker_overrides)
         attributed = attributed_turns_from_diarized_segments(
             asr_result.get("segments", []),
             speaker_mapping,

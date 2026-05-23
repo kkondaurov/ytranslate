@@ -216,9 +216,56 @@ class DiarizedAsrTests(unittest.TestCase):
             ],
         )
 
+    def test_speaker_mapping_override_remaps_chunk_local_speaker_by_id(self):
+        speaker_mapping = {
+            "speakers": [
+                {"id": "speaker_gavin", "label_short": "Gavin", "label_full": "Gavin Baker"},
+                {"id": "speaker_chamath", "label_short": "Chamath", "label_full": "Chamath Palihapitiya"},
+            ],
+            "local_speakers": [
+                {"chunk_index": 3, "local_speaker": "B", "speaker_id": "speaker_gavin"},
+                {"chunk_index": 3, "local_speaker": "C", "speaker_id": "speaker_chamath"},
+            ],
+        }
+        overrides = {
+            "local_speakers": [
+                {"chunk_index": 3, "local_speaker": "B", "speaker_id": "speaker_chamath"},
+            ]
+        }
+
+        effective = ytranslate.apply_speaker_mapping_overrides(speaker_mapping, overrides)
+
+        self.assertEqual(
+            effective["local_speakers"],
+            [
+                {"chunk_index": 3, "local_speaker": "B", "speaker_id": "speaker_chamath"},
+                {"chunk_index": 3, "local_speaker": "C", "speaker_id": "speaker_chamath"},
+            ],
+        )
+
+    def test_speaker_mapping_override_can_resolve_existing_speaker_by_label(self):
+        speaker_mapping = {
+            "speakers": [
+                {"id": "speaker_gavin", "label_short": "Gavin", "label_full": "Gavin Baker"},
+                {"id": "speaker_chamath", "label_short": "Chamath", "label_full": "Chamath Palihapitiya"},
+            ],
+            "local_speakers": [
+                {"chunk_index": 3, "local_speaker": "B", "speaker_id": "speaker_gavin"},
+            ],
+        }
+        overrides = {
+            "local_speakers": [
+                {"chunk_index": 3, "local_speaker": "B", "speaker_label": "Chamath"},
+            ]
+        }
+
+        effective = ytranslate.apply_speaker_mapping_overrides(speaker_mapping, overrides)
+
+        self.assertEqual(effective["local_speakers"][0]["speaker_id"], "speaker_chamath")
+
 
 class RunTranslationJobSourceChoiceTests(unittest.TestCase):
-    def run_with_common_mocks(self, transcript_info):
+    def run_with_common_mocks(self, transcript_info, speaker_overrides=None):
         asr_result = {
             "model": "gpt-4o-transcribe-diarize",
             "chunk_seconds": 1200,
@@ -264,6 +311,7 @@ class RunTranslationJobSourceChoiceTests(unittest.TestCase):
             patch.object(ytranslate, "fetch_transcript", return_value=transcript_info),
             patch.object(ytranslate, "transcribe_youtube_audio_with_openai", return_value=asr_result) as asr_mock,
             patch.object(ytranslate, "assign_global_speakers_for_diarized_segments", return_value=speaker_mapping) as mapping_mock,
+            patch.object(ytranslate, "load_speaker_mapping_overrides", return_value=speaker_overrides),
             patch.object(ytranslate, "translate_attributed_turns", side_effect=fake_translate),
             patch.object(ytranslate, "render_docx") as render_mock,
             patch.object(ytranslate, "convert_docx_to_pdf", return_value="/tmp/video.pdf"),
@@ -290,6 +338,35 @@ class RunTranslationJobSourceChoiceTests(unittest.TestCase):
         mapping_mock.assert_called_once()
         rendered_turns = render_mock.call_args.args[2]
         self.assertEqual(rendered_turns[0]["speaker_id"], "speaker_asr")
+
+    def test_low_quality_asr_applies_speaker_mapping_overrides(self):
+        transcript_info = {
+            "is_generated": True,
+            "segments": [
+                {"start": 0, "duration": 1, "text": "speakerless caption"},
+            ],
+        }
+        speaker_overrides = {
+            "speakers": [
+                {"id": "speaker_override", "label_short": "Override", "label_full": "Override"},
+            ],
+            "local_speakers": [
+                {"chunk_index": 1, "local_speaker": "A", "speaker_id": "speaker_override"},
+            ],
+        }
+
+        _result, _asr_mock, _mapping_mock, render_mock = self.run_with_common_mocks(
+            transcript_info,
+            speaker_overrides=speaker_overrides,
+        )
+
+        rendered_speakers = render_mock.call_args.args[1]
+        rendered_turns = render_mock.call_args.args[2]
+        self.assertIn(
+            {"id": "speaker_override", "label_short": "Override", "label_full": "Override"},
+            rendered_speakers,
+        )
+        self.assertEqual(rendered_turns[0]["speaker_id"], "speaker_override")
 
     def test_speaker_labeled_youtube_transcript_skips_openai_asr(self):
         transcript_info = {

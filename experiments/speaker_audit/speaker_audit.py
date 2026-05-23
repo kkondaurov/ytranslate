@@ -416,8 +416,16 @@ def load_or_create_mapping(
     run_mapping: bool,
 ) -> Optional[Dict[str, Any]]:
     mapping_path = output_dir / "speaker-mapping.json"
+    overrides = ytranslate.load_speaker_mapping_overrides(
+        video_id,
+        extra_paths=[str(output_dir / ytranslate.SPEAKER_OVERRIDES_FILENAME)],
+    )
     if mapping_path.exists():
-        return read_json(mapping_path)
+        mapping = read_json(mapping_path)
+        if overrides:
+            mapping = ytranslate.apply_speaker_mapping_overrides(mapping, overrides)
+            write_json(output_dir / "speaker-mapping-effective.json", mapping)
+        return mapping
     if not run_mapping:
         return None
     openai_key = os.getenv("OPENAI_API_KEY")
@@ -437,6 +445,9 @@ def load_or_create_mapping(
         debug_sink=debug_sink,
     )
     write_json(mapping_path, mapping)
+    if overrides:
+        mapping = ytranslate.apply_speaker_mapping_overrides(mapping, overrides)
+        write_json(output_dir / "speaker-mapping-effective.json", mapping)
     if debug_sink:
         write_json(output_dir / "speaker-mapping-debug.json", debug_sink[0])
     return mapping
