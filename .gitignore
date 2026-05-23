@@ -6,3 +6,4 @@ __pycache__/
 translations/
 *.egg-info/
 experiments/asr_compare/output/
+experiments/speaker_audit/output/
