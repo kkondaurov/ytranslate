@@ -127,7 +127,7 @@ export YOUTUBE_API_KEY=\"...\"
 
 ## Notes
 - Transcript source selection is either/or. A manual YouTube transcript is used only when it clearly includes speaker labels. Otherwise the tool downloads audio and uses OpenAI diarized ASR (`gpt-4o-transcribe-diarize`). It does not fall back to speakerless YouTube auto-captions.
-- OpenAI ASR audio is cached under `~/Library/Caches/ytranslate/` and split into compressed chunks under the upload limit. The default ASR chunk length is 45 minutes; override with `OPENAI_ASR_CHUNK_SECONDS` if needed.
+- OpenAI ASR audio is cached under `~/Library/Caches/ytranslate/` and split into compressed chunks under the upload limit. The default ASR chunk length is 20 minutes, safely below the diarized ASR model's 1400-second limit; override with `OPENAI_ASR_CHUNK_SECONDS` if needed.
 - Metadata (title/description) is fetched via the official YouTube Data API to help infer speakers.
 - The Chrome extension talks to `http://127.0.0.1:8765`.
 - The extension displays YouTube-style bottom-left toast notifications for request feedback.

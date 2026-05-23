@@ -34,7 +34,8 @@ OPENAI_TIMEOUT_SECONDS = 1800
 OPENAI_TEMPERATURE = 0.2
 OPENAI_CLEANUP_TEMPERATURE = 0.0
 OPENAI_ANNOTATION_TEMPERATURE = 0.0
-ASR_CHUNK_SECONDS = 2700
+ASR_MAX_CHUNK_SECONDS = 1400
+ASR_CHUNK_SECONDS = 1200
 ASR_AUDIO_BITRATE = "64k"
 ASR_SAMPLE_RATE = "16000"
 ASR_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
@@ -486,6 +487,22 @@ def build_chunk_offsets(chunks: List[str]) -> List[float]:
     return offsets
 
 
+def get_asr_chunk_seconds() -> int:
+    raw = os.getenv("OPENAI_ASR_CHUNK_SECONDS", str(ASR_CHUNK_SECONDS))
+    try:
+        chunk_seconds = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"OPENAI_ASR_CHUNK_SECONDS must be an integer, got {raw!r}") from exc
+    if chunk_seconds <= 0:
+        raise RuntimeError("OPENAI_ASR_CHUNK_SECONDS must be positive")
+    if chunk_seconds > ASR_MAX_CHUNK_SECONDS:
+        raise RuntimeError(
+            "OPENAI_ASR_CHUNK_SECONDS exceeds the OpenAI ASR model limit: "
+            f"{chunk_seconds}s > {ASR_MAX_CHUNK_SECONDS}s. Use {ASR_CHUNK_SECONDS}s or lower."
+        )
+    return chunk_seconds
+
+
 def transcribe_audio_chunk(
     chunk_path: str,
     openai_key: str,
@@ -787,7 +804,7 @@ def transcribe_youtube_audio_with_openai(
     log: Callable[[str], None],
 ) -> Dict[str, Any]:
     asr_model = os.getenv("OPENAI_ASR_MODEL", OPENAI_ASR_MODEL)
-    chunk_seconds = int(os.getenv("OPENAI_ASR_CHUNK_SECONDS", str(ASR_CHUNK_SECONDS)))
+    chunk_seconds = get_asr_chunk_seconds()
     jobs = max(1, int(os.getenv("OPENAI_ASR_JOBS", str(ASR_JOBS))))
     cache_dir = get_video_cache_dir(video_id)
     result_path = os.path.join(cache_dir, f"openai-asr-{asr_model}-{chunk_seconds}s.json")

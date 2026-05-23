@@ -61,6 +61,14 @@ class TranscriptSourceTests(unittest.TestCase):
 
 
 class DiarizedAsrTests(unittest.TestCase):
+    def test_default_asr_chunk_length_stays_under_model_limit(self):
+        self.assertLessEqual(ytranslate.ASR_CHUNK_SECONDS, ytranslate.ASR_MAX_CHUNK_SECONDS)
+
+    def test_asr_chunk_length_rejects_values_above_model_limit(self):
+        with patch.dict("os.environ", {"OPENAI_ASR_CHUNK_SECONDS": "2700"}):
+            with self.assertRaisesRegex(RuntimeError, "exceeds the OpenAI ASR model limit"):
+                ytranslate.get_asr_chunk_seconds()
+
     def test_extract_diarized_segments_normalizes_openai_response(self):
         response = {
             "segments": [
@@ -213,7 +221,7 @@ class RunTranslationJobSourceChoiceTests(unittest.TestCase):
     def run_with_common_mocks(self, transcript_info):
         asr_result = {
             "model": "gpt-4o-transcribe-diarize",
-            "chunk_seconds": 2700,
+            "chunk_seconds": 1200,
             "segments": [
                 {
                     "chunk_index": 1,
