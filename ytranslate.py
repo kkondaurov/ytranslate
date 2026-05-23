@@ -10,6 +10,7 @@ import subprocess
 import time
 import unicodedata
 import inspect
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -26,15 +27,24 @@ YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
 DEFAULT_MODEL = "gpt-5.4-mini"
+OPENAI_ASR_MODEL = "gpt-4o-transcribe-diarize"
+OPENAI_TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions"
 DEFAULT_TARGET_LANGUAGE = "Russian"
 OPENAI_TIMEOUT_SECONDS = 1800
 OPENAI_TEMPERATURE = 0.2
 OPENAI_CLEANUP_TEMPERATURE = 0.0
 OPENAI_ANNOTATION_TEMPERATURE = 0.0
+ASR_CHUNK_SECONDS = 2700
+ASR_AUDIO_BITRATE = "64k"
+ASR_SAMPLE_RATE = "16000"
+ASR_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+ASR_JOBS = 2
+ASR_MAX_RETRIES = 8
 DOCX_FONT_NAME = "Arial"
 DOCX_FONT_SIZE = Pt(13)
 DOCX_HEADING_FONT_SIZE = Pt(16)
 OUTPUT_DIR = os.path.expanduser("~/Downloads")
+CACHE_DIR = os.path.expanduser("~/Library/Caches/ytranslate")
 
 
 def parse_args() -> argparse.Namespace:
@@ -258,6 +268,592 @@ def normalize_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return normalized
 
 
+SPEAKER_LABEL_RE = re.compile(
+    r"^\s*(?:\[(?P<bracket>[^\]]{1,40})\]|(?P<plain>[A-Z][A-Za-z0-9 ._'’-]{0,40})):\s+(?P<body>\S.*)$"
+)
+
+
+def split_speaker_label(text: str) -> Optional[Dict[str, str]]:
+    match = SPEAKER_LABEL_RE.match(text or "")
+    if not match:
+        return None
+    label = (match.group("bracket") or match.group("plain") or "").strip()
+    body = (match.group("body") or "").strip()
+    if not label or not body:
+        return None
+    return {"label": label, "text": body}
+
+
+def speaker_id_from_label(label: str) -> str:
+    normalized = unicodedata.normalize("NFKD", label or "")
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii").lower()
+    ascii_text = re.sub(r"[^a-z0-9]+", "_", ascii_text).strip("_")
+    return f"speaker_{ascii_text or 'unknown'}"
+
+
+def is_high_quality_youtube_transcript(transcript_info: Dict[str, Any]) -> bool:
+    if transcript_info.get("is_generated"):
+        return False
+    segments = normalize_segments(transcript_info.get("segments", []))
+    if not segments:
+        return False
+    labels = []
+    for segment in segments:
+        parsed = split_speaker_label(segment.get("text", ""))
+        if parsed:
+            labels.append(parsed["label"].lower())
+    min_labeled = min(8, max(4, len(segments) // 10))
+    return (
+        len(set(labels)) >= 2
+        and len(labels) >= min_labeled
+        and (len(labels) / len(segments)) >= 0.3
+    )
+
+
+def make_speaker(label: str) -> Dict[str, str]:
+    return {
+        "id": speaker_id_from_label(label),
+        "label_short": label,
+        "label_full": label,
+    }
+
+
+def attributed_turns_from_labeled_segments(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
+    speakers_by_id: Dict[str, Dict[str, str]] = {}
+    turns: List[Dict[str, str]] = []
+    current_speaker_id: Optional[str] = None
+
+    for segment in segments:
+        text = clean_segment_text(segment.get("text", ""))
+        if not text:
+            continue
+        parsed = split_speaker_label(text)
+        if parsed:
+            speaker = make_speaker(parsed["label"])
+            speakers_by_id.setdefault(speaker["id"], speaker)
+            current_speaker_id = speaker["id"]
+            text = parsed["text"]
+        if not current_speaker_id:
+            current_speaker_id = "speaker_unknown"
+            speakers_by_id.setdefault(
+                current_speaker_id,
+                {
+                    "id": current_speaker_id,
+                    "label_short": "Speaker",
+                    "label_full": "Speaker",
+                },
+            )
+        if turns and turns[-1].get("speaker_id") == current_speaker_id:
+            turns[-1]["text_source"] = (turns[-1].get("text_source", "") + " " + text).strip()
+        else:
+            turns.append({"speaker_id": current_speaker_id, "text_source": text})
+
+    return {
+        "speakers": list(speakers_by_id.values()),
+        "turns": turns,
+    }
+
+
+def get_ffmpeg_executable() -> str:
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    try:
+        import imageio_ffmpeg
+    except ImportError as exc:
+        raise RuntimeError(
+            "ffmpeg is required for OpenAI ASR. Install ffmpeg or install the "
+            "imageio-ffmpeg Python package from requirements.txt."
+        ) from exc
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def get_video_cache_dir(video_id: str) -> str:
+    cache_dir = os.path.join(CACHE_DIR, sanitize_filename(video_id))
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def download_youtube_audio(url: str, video_id: str, log: Callable[[str], None]) -> str:
+    audio_dir = os.path.join(get_video_cache_dir(video_id), "audio")
+    os.makedirs(audio_dir, exist_ok=True)
+    for filename in sorted(os.listdir(audio_dir)):
+        if filename.startswith("source.") and not filename.endswith(".part"):
+            return os.path.join(audio_dir, filename)
+
+    output_template = os.path.join(audio_dir, "source.%(ext)s")
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "-f",
+        "ba[ext=m4a]/ba[ext=webm]/ba/bestaudio",
+        "-o",
+        output_template,
+        "--no-playlist",
+        url,
+    ]
+    log("Downloading audio for OpenAI ASR...")
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError("Failed to download YouTube audio with yt-dlp") from exc
+
+    for filename in sorted(os.listdir(audio_dir)):
+        if filename.startswith("source.") and not filename.endswith(".part"):
+            return os.path.join(audio_dir, filename)
+    raise RuntimeError("yt-dlp did not produce an audio file")
+
+
+def transcode_and_chunk_audio(
+    source_audio_path: str,
+    video_id: str,
+    chunk_seconds: int,
+    log: Callable[[str], None],
+) -> List[str]:
+    chunk_dir = os.path.join(get_video_cache_dir(video_id), f"chunks-{chunk_seconds}s")
+    os.makedirs(chunk_dir, exist_ok=True)
+    existing = sorted(
+        os.path.join(chunk_dir, name)
+        for name in os.listdir(chunk_dir)
+        if re.match(r"chunk-\d{3}\.mp3$", name)
+    )
+    if existing:
+        return existing
+
+    ffmpeg = get_ffmpeg_executable()
+    output_pattern = os.path.join(chunk_dir, "chunk-%03d.mp3")
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-y",
+        "-i",
+        source_audio_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        ASR_SAMPLE_RATE,
+        "-b:a",
+        ASR_AUDIO_BITRATE,
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_seconds),
+        "-reset_timestamps",
+        "1",
+        output_pattern,
+    ]
+    log("Compressing and chunking audio for OpenAI ASR...")
+    subprocess.run(command, check=True)
+    chunks = sorted(
+        os.path.join(chunk_dir, name)
+        for name in os.listdir(chunk_dir)
+        if re.match(r"chunk-\d{3}\.mp3$", name)
+    )
+    oversized = [path for path in chunks if os.path.getsize(path) > ASR_MAX_UPLOAD_BYTES]
+    if oversized:
+        raise RuntimeError(
+            "Audio chunk exceeds OpenAI upload limit: "
+            + ", ".join(os.path.basename(path) for path in oversized)
+        )
+    if not chunks:
+        raise RuntimeError("ffmpeg did not produce any audio chunks")
+    return chunks
+
+
+def probe_audio_duration_seconds(audio_path: str) -> float:
+    ffmpeg = get_ffmpeg_executable()
+    completed = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", audio_path, "-f", "null", "-"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", completed.stderr)
+    if not match:
+        raise RuntimeError(f"Unable to parse audio duration for {audio_path}")
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+
+def build_chunk_offsets(chunks: List[str]) -> List[float]:
+    offsets: List[float] = []
+    current = 0.0
+    for chunk in chunks:
+        offsets.append(round(current, 3))
+        current += probe_audio_duration_seconds(chunk)
+    return offsets
+
+
+def transcribe_audio_chunk(
+    chunk_path: str,
+    openai_key: str,
+    asr_model: str,
+    timeout_seconds: int,
+) -> Dict[str, Any]:
+    headers = {"Authorization": f"Bearer {openai_key}"}
+    data = {
+        "model": asr_model,
+        "response_format": "diarized_json",
+        "chunking_strategy": "auto",
+    }
+    for attempt in range(1, ASR_MAX_RETRIES + 1):
+        try:
+            with open(chunk_path, "rb") as audio_file:
+                files = {"file": (os.path.basename(chunk_path), audio_file, "audio/mpeg")}
+                response = requests.post(
+                    OPENAI_TRANSCRIBE_URL,
+                    headers=headers,
+                    data=data,
+                    files=files,
+                    timeout=timeout_seconds,
+                )
+        except requests.RequestException as exc:
+            if attempt == ASR_MAX_RETRIES:
+                raise RuntimeError(
+                    f"OpenAI ASR upload failed after retries for {os.path.basename(chunk_path)}: {exc}"
+                ) from exc
+            time.sleep(min(60, 5 * attempt))
+            continue
+
+        if response.status_code < 500 and response.status_code != 429:
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"OpenAI ASR failed for {os.path.basename(chunk_path)}: "
+                    f"{response.status_code} {response.text[:1000]}"
+                )
+            return response.json()
+
+        if attempt == ASR_MAX_RETRIES:
+            raise RuntimeError(
+                f"OpenAI ASR failed after retries for {os.path.basename(chunk_path)}: "
+                f"{response.status_code} {response.text[:1000]}"
+            )
+        time.sleep(min(60, 5 * attempt))
+
+    raise RuntimeError("Unreachable OpenAI ASR retry state")
+
+
+def extract_diarized_segments(response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    segments = response.get("segments") or []
+    normalized: List[Dict[str, Any]] = []
+    for segment in segments:
+        text = clean_segment_text(str(segment.get("text") or ""))
+        if not text:
+            continue
+        start = float(segment.get("start") or 0)
+        end = float(segment.get("end") or start)
+        normalized.append(
+            {
+                "speaker": str(segment.get("speaker") or "speaker"),
+                "start": start,
+                "end": end,
+                "text": text,
+            }
+        )
+    if normalized:
+        return normalized
+    text = clean_segment_text(str(response.get("text") or ""))
+    return [{"speaker": "speaker", "start": 0.0, "end": 0.0, "text": text}] if text else []
+
+
+def merge_diarized_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        offset = float(chunk.get("offset_seconds") or 0)
+        chunk_index = int(chunk.get("chunk_index") or 0)
+        chunk_name = str(chunk.get("chunk") or "")
+        for segment in chunk.get("segments", []):
+            text = clean_segment_text(segment.get("text", ""))
+            if not text:
+                continue
+            start = float(segment.get("start") or 0) + offset
+            end = float(segment.get("end") or segment.get("start") or 0) + offset
+            local_speaker = str(segment.get("speaker") or "speaker")
+            merged.append(
+                {
+                    "speaker": local_speaker,
+                    "local_speaker": local_speaker,
+                    "chunk_index": chunk_index,
+                    "chunk": chunk_name,
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "text": text,
+                }
+            )
+    return merged
+
+
+def build_local_speaker_profiles(
+    segments: List[Dict[str, Any]],
+    max_chars_per_profile: int = 1800,
+) -> List[Dict[str, Any]]:
+    profiles_by_key: Dict[Any, Dict[str, Any]] = {}
+    order: List[Any] = []
+    for segment in segments:
+        chunk_index = int(segment.get("chunk_index") or 0)
+        local_speaker = str(segment.get("local_speaker") or segment.get("speaker") or "speaker")
+        key = (chunk_index, local_speaker)
+        if key not in profiles_by_key:
+            profiles_by_key[key] = {
+                "chunk_index": chunk_index,
+                "local_speaker": local_speaker,
+                "segment_count": 0,
+                "start": float(segment.get("start") or 0),
+                "end": float(segment.get("end") or segment.get("start") or 0),
+                "samples": [],
+                "_sample_chars": 0,
+            }
+            order.append(key)
+        profile = profiles_by_key[key]
+        profile["segment_count"] += 1
+        profile["end"] = float(segment.get("end") or segment.get("start") or profile["end"])
+        text = clean_segment_text(segment.get("text", ""))
+        if text and profile["_sample_chars"] < max_chars_per_profile:
+            remaining = max_chars_per_profile - profile["_sample_chars"]
+            sample = text[:remaining]
+            profile["samples"].append(sample)
+            profile["_sample_chars"] += len(sample)
+
+    profiles: List[Dict[str, Any]] = []
+    for key in order:
+        profile = dict(profiles_by_key[key])
+        profile.pop("_sample_chars", None)
+        profile["start"] = round(float(profile["start"]), 3)
+        profile["end"] = round(float(profile["end"]), 3)
+        profiles.append(profile)
+    return profiles
+
+
+def get_local_speaker_mapping_schema(profile_count: int) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "speakers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "label_short": {"type": "string"},
+                        "label_full": {"type": "string"},
+                    },
+                    "required": ["id", "label_short", "label_full"],
+                },
+            },
+            "local_speakers": {
+                "type": "array",
+                "minItems": profile_count,
+                "maxItems": profile_count,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "chunk_index": {"type": "integer"},
+                        "local_speaker": {"type": "string"},
+                        "speaker_id": {"type": "string"},
+                    },
+                    "required": ["chunk_index", "local_speaker", "speaker_id"],
+                },
+            },
+        },
+        "required": ["speakers", "local_speakers"],
+    }
+
+
+def build_local_speaker_mapping_system_prompt() -> str:
+    return (
+        "You reconcile speaker identities across separately transcribed audio chunks. "
+        "The ASR speaker labels are local to each chunk and may reset in every chunk. "
+        "For example, local speaker A in chunk 1 may be a different person from local speaker A in chunk 2. "
+        "Use the video title, description, timestamps, and sample text to infer stable global speakers. "
+        "Map every local chunk speaker to one stable global speaker ID. "
+        "If a real name or role can be inferred reliably, use it in the labels; otherwise use Speaker 1, Speaker 2, etc. "
+        "Return only JSON that matches the provided schema."
+    )
+
+
+def build_local_speaker_mapping_user_prompt(
+    url: str,
+    title: str,
+    description: str,
+    profiles: List[Dict[str, Any]],
+    source_language_hint: Optional[str],
+) -> str:
+    lines = [
+        f"Video URL: {url}",
+        f"Title: {title}",
+        f"Description: {description}",
+    ]
+    if source_language_hint:
+        lines.append(f"Source language hint: {source_language_hint}")
+    lines.append("")
+    lines.append("Local speaker profiles:")
+    for profile in profiles:
+        samples = " / ".join(profile.get("samples", []))
+        lines.append(
+            f"- chunk {profile['chunk_index']} local speaker {profile['local_speaker']} "
+            f"({format_timecode(profile.get('start'))}-{format_timecode(profile.get('end'))}, "
+            f"{profile['segment_count']} segments): {samples}"
+        )
+    return "\n".join(lines)
+
+
+def assign_global_speakers_for_diarized_segments(
+    client: OpenAI,
+    model: str,
+    url: str,
+    title: str,
+    description: str,
+    segments: List[Dict[str, Any]],
+    source_language_hint: Optional[str],
+    debug_sink: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    profiles = build_local_speaker_profiles(segments)
+    if not profiles:
+        return {"speakers": [], "local_speakers": []}
+    result = call_openai_with_retry(
+        client,
+        model,
+        build_local_speaker_mapping_system_prompt(),
+        build_local_speaker_mapping_user_prompt(
+            url,
+            title,
+            description,
+            profiles,
+            source_language_hint,
+        ),
+        schema_name="local_speaker_mapping",
+        schema=get_local_speaker_mapping_schema(len(profiles)),
+        temperature=0.0,
+    )
+    if debug_sink is not None:
+        debug_sink.append({"profiles": profiles, "result": result})
+    return result
+
+
+def attributed_turns_from_diarized_segments(
+    segments: List[Dict[str, Any]],
+    speaker_mapping: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    speakers_by_id: Dict[str, Dict[str, str]] = {}
+    turns: List[Dict[str, str]] = []
+    mapping_by_local = {}
+    if speaker_mapping:
+        for speaker in speaker_mapping.get("speakers", []):
+            speakers_by_id[speaker["id"]] = speaker
+        mapping_by_local = {
+            (int(item.get("chunk_index") or 0), str(item.get("local_speaker") or "speaker")): item.get("speaker_id")
+            for item in speaker_mapping.get("local_speakers", [])
+        }
+
+    for segment in segments:
+        raw_speaker = str(segment.get("speaker") or "speaker")
+        speaker_label = raw_speaker if raw_speaker.lower().startswith("speaker") else f"Speaker {raw_speaker}"
+        local_speaker = str(segment.get("local_speaker") or raw_speaker)
+        chunk_index = int(segment.get("chunk_index") or 0)
+        speaker_id = mapping_by_local.get((chunk_index, local_speaker))
+        if not speaker_id:
+            speaker_id = speaker_id_from_label(raw_speaker)
+            speakers_by_id.setdefault(
+                speaker_id,
+                {
+                    "id": speaker_id,
+                    "label_short": speaker_label,
+                    "label_full": speaker_label,
+                },
+            )
+        text = clean_segment_text(segment.get("text", ""))
+        if not text:
+            continue
+        if turns and turns[-1].get("speaker_id") == speaker_id:
+            turns[-1]["text_source"] = (turns[-1].get("text_source", "") + " " + text).strip()
+        else:
+            turns.append({"speaker_id": speaker_id, "text_source": text})
+
+    return {
+        "speakers": list(speakers_by_id.values()),
+        "turns": turns,
+    }
+
+
+def transcribe_youtube_audio_with_openai(
+    url: str,
+    video_id: str,
+    openai_key: str,
+    log: Callable[[str], None],
+) -> Dict[str, Any]:
+    asr_model = os.getenv("OPENAI_ASR_MODEL", OPENAI_ASR_MODEL)
+    chunk_seconds = int(os.getenv("OPENAI_ASR_CHUNK_SECONDS", str(ASR_CHUNK_SECONDS)))
+    jobs = max(1, int(os.getenv("OPENAI_ASR_JOBS", str(ASR_JOBS))))
+    cache_dir = get_video_cache_dir(video_id)
+    result_path = os.path.join(cache_dir, f"openai-asr-{asr_model}-{chunk_seconds}s.json")
+    if os.path.exists(result_path):
+        return read_json_file(result_path)
+
+    audio_path = download_youtube_audio(url, video_id, log)
+    chunks = transcode_and_chunk_audio(audio_path, video_id, chunk_seconds, log)
+    offsets = build_chunk_offsets(chunks)
+    raw_dir = os.path.join(cache_dir, f"openai-asr-chunks-{asr_model}-{chunk_seconds}s")
+    os.makedirs(raw_dir, exist_ok=True)
+
+    pending = []
+    raw_by_index: Dict[int, Dict[str, Any]] = {}
+    for index, chunk in enumerate(chunks):
+        raw_path = os.path.join(raw_dir, f"{os.path.splitext(os.path.basename(chunk))[0]}.json")
+        if os.path.exists(raw_path):
+            raw_by_index[index] = read_json_file(raw_path)
+        else:
+            pending.append((index, chunk, raw_path))
+
+    def run_one(item: Any) -> Any:
+        index, chunk, raw_path = item
+        log(f"Running OpenAI ASR on {os.path.basename(chunk)}...")
+        raw = transcribe_audio_chunk(chunk, openai_key, asr_model, OPENAI_TIMEOUT_SECONDS)
+        write_json_file(raw_path, raw)
+        return index, raw
+
+    if pending:
+        worker_count = min(jobs, len(pending))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(run_one, item) for item in pending]
+            for future in as_completed(futures):
+                index, raw = future.result()
+                raw_by_index[index] = raw
+
+    chunk_results = []
+    for index, chunk in enumerate(chunks):
+        raw = raw_by_index[index]
+        chunk_results.append(
+            {
+                "chunk_index": index + 1,
+                "chunk": os.path.basename(chunk),
+                "offset_seconds": offsets[index],
+                "segments": extract_diarized_segments(raw),
+            }
+        )
+
+    result = {
+        "source": "openai_asr",
+        "model": asr_model,
+        "chunk_seconds": chunk_seconds,
+        "chunks": [
+            {
+                "chunk": item["chunk"],
+                "offset_seconds": item["offset_seconds"],
+                "segment_count": len(item["segments"]),
+            }
+            for item in chunk_results
+        ],
+        "segments": merge_diarized_chunks(chunk_results),
+    }
+    write_json_file(result_path, result)
+    return result
+
+
 def format_timecode(seconds: Optional[float]) -> str:
     if seconds is None:
         return "??:??:??"
@@ -282,6 +878,11 @@ def write_json_file(path: str, data: Any) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
+
+
+def read_json_file(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def write_text_file(path: str, text: str) -> None:
@@ -1749,60 +2350,85 @@ def run_translation_job(
     cleanup_pass_debug: List[Dict[str, Any]] = []
     annotation_pass_debug: List[Dict[str, Any]] = []
 
-    log("Fetching transcript...")
+    client = OpenAI(api_key=openai_key, timeout=OPENAI_TIMEOUT_SECONDS)
+    model = os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
+
+    log("Checking YouTube transcript quality...")
     preferred_langs = [
         metadata.get("defaultAudioLanguage"),
         metadata.get("defaultLanguage"),
     ]
+    transcript_info: Optional[Dict[str, Any]] = None
+    youtube_segments: List[Dict[str, Any]] = []
     try:
         transcript_info = fetch_transcript(video_id, preferred_langs)
-    except TranscriptsDisabled as exc:
-        raise RuntimeError("Transcripts are disabled for this video.") from exc
-    except NoTranscriptFound as exc:
-        raise RuntimeError("No transcript found for this video.") from exc
-
-    segments = normalize_segments(transcript_info.get("segments", []))
-    if not segments:
-        raise RuntimeError("Transcript was empty after normalization.")
+        youtube_segments = normalize_segments(transcript_info.get("segments", []))
+    except (TranscriptsDisabled, NoTranscriptFound):
+        log("No YouTube transcript available; using OpenAI diarized ASR.")
+    except Exception as exc:
+        log(f"Could not inspect YouTube transcript ({exc}); using OpenAI diarized ASR.")
 
     if debug_dir:
         write_json_file(
             os.path.join(debug_dir, "metadata.json"),
             metadata,
         )
-        write_json_file(
-            os.path.join(debug_dir, "raw-transcript.json"),
-            transcript_info,
-        )
-        write_text_file(
-            os.path.join(debug_dir, "normalized-transcript.md"),
-            "# Normalized Transcript\n\n" + format_segments(segments) + "\n",
-        )
-        log(f"Wrote transcript debug artifacts to {debug_dir}")
+        if transcript_info is not None:
+            write_json_file(os.path.join(debug_dir, "youtube-transcript.json"), transcript_info)
+            write_text_file(
+                os.path.join(debug_dir, "youtube-normalized-transcript.md"),
+                "# YouTube Normalized Transcript\n\n" + format_segments(youtube_segments) + "\n",
+            )
 
-    log("Attributing speakers and structuring turns...")
-    client = OpenAI(api_key=openai_key, timeout=OPENAI_TIMEOUT_SECONDS)
-    model = os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
-    attributed = attribute_speakers(
-        client,
-        model,
-        canonical_url,
-        title,
-        description,
-        segments,
-        source_language_hint,
-        debug_sink=speaker_pass_debug if debug else None,
-    )
+    transcript_source = ""
+    asr_result: Optional[Dict[str, Any]] = None
+    speaker_mapping: Optional[Dict[str, Any]] = None
+    if transcript_info is not None and is_high_quality_youtube_transcript(transcript_info):
+        log("Using manual speaker-labeled YouTube transcript.")
+        transcript_source = "youtube_speaker_labeled"
+        attributed = attributed_turns_from_labeled_segments(youtube_segments)
+    else:
+        if transcript_info is not None:
+            log("YouTube transcript is not speaker-labeled; using OpenAI diarized ASR.")
+        asr_result = transcribe_youtube_audio_with_openai(
+            canonical_url,
+            video_id,
+            openai_key,
+            log,
+        )
+        transcript_source = "openai_asr"
+        log("Reconciling ASR chunk-local speakers into global speakers...")
+        speaker_mapping = assign_global_speakers_for_diarized_segments(
+            client,
+            model,
+            canonical_url,
+            title,
+            description,
+            asr_result.get("segments", []),
+            source_language_hint,
+            debug_sink=speaker_pass_debug if debug else None,
+        )
+        attributed = attributed_turns_from_diarized_segments(
+            asr_result.get("segments", []),
+            speaker_mapping,
+        )
+
+    if not attributed.get("turns"):
+        raise RuntimeError("Transcript source produced no attributed turns.")
 
     if debug_dir:
+        write_json_file(os.path.join(debug_dir, "source-attributed-turns.json"), attributed)
+        if asr_result is not None:
+            write_json_file(os.path.join(debug_dir, "openai-asr.json"), asr_result)
+        if speaker_mapping is not None:
+            write_json_file(os.path.join(debug_dir, "speaker-mapping.json"), speaker_mapping)
         if speaker_pass_debug:
             for idx, item in enumerate(speaker_pass_debug, 1):
                 write_json_file(
-                    os.path.join(debug_dir, f"speaker-pass-{idx:02d}.json"),
+                    os.path.join(debug_dir, f"speaker-mapping-pass-{idx:02d}.json"),
                     item,
                 )
-        else:
-            write_json_file(os.path.join(debug_dir, "speaker-pass.json"), attributed)
+        log(f"Wrote transcript debug artifacts to {debug_dir}")
 
     log("Translating attributed turns...")
     result = translate_attributed_turns(
@@ -1875,6 +2501,9 @@ def run_translation_job(
                 "video_id": video_id,
                 "target_language": resolved_target_language,
                 "model": model,
+                "transcript_source": transcript_source,
+                "asr_model": (asr_result or {}).get("model", ""),
+                "asr_chunk_seconds": (asr_result or {}).get("chunk_seconds", ""),
                 "timeout_seconds": OPENAI_TIMEOUT_SECONDS,
                 "temperature": OPENAI_TEMPERATURE,
                 "cleanup_temperature": OPENAI_CLEANUP_TEMPERATURE,

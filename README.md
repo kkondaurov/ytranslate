@@ -1,12 +1,13 @@
 # ytranslate
 
-Translate a YouTube video's transcript into a target language and structure it as a conversation.
+Translate a YouTube video into a target language and structure it as a conversation.
 
 ## Requirements
 - Python 3.9+
 - Google Chrome
 - OpenAI API key (`OPENAI_API_KEY`)
 - YouTube Data API key (`YOUTUBE_API_KEY`)
+- Audio transcription dependencies from `requirements.txt` (`yt-dlp` and bundled `imageio-ffmpeg`)
 
 ## Install
 ### With uv (recommended)
@@ -82,6 +83,7 @@ You can also put your keys in a local `.env` file in the project root:
 OPENAI_API_KEY=...
 YOUTUBE_API_KEY=...
 OPENAI_MODEL=gpt-5.4-mini
+OPENAI_ASR_MODEL=gpt-4o-transcribe-diarize
 DEFAULT_TARGET_LANGUAGE=Russian
 ```
 
@@ -102,9 +104,10 @@ ytranslate-debug-<video-id>-<timestamp>-<video-title>/
 
 Artifacts include:
 - `metadata.json`
-- `raw-transcript.json`
-- `normalized-transcript.md`
-- `speaker-pass-*.json`
+- `youtube-transcript.json` and `youtube-normalized-transcript.md` when a YouTube transcript is available
+- `openai-asr.json` when OpenAI diarized ASR is used
+- `speaker-mapping*.json` when ASR chunk-local speakers are reconciled globally
+- `source-attributed-turns.json`
 - `translation-pass-*.json`
 - `cleanup-pass-*.json` (when Russian cleanup runs)
 - `annotation-pass-*.json` (when Russian annotation runs)
@@ -123,7 +126,8 @@ export YOUTUBE_API_KEY=\"...\"
 ```
 
 ## Notes
-- Transcript retrieval uses an unofficial endpoint via `youtube-transcript-api`. Some videos do not expose transcripts or may block these requests.
+- Transcript source selection is either/or. A manual YouTube transcript is used only when it clearly includes speaker labels. Otherwise the tool downloads audio and uses OpenAI diarized ASR (`gpt-4o-transcribe-diarize`). It does not fall back to speakerless YouTube auto-captions.
+- OpenAI ASR audio is cached under `~/Library/Caches/ytranslate/` and split into compressed chunks under the upload limit. The default ASR chunk length is 45 minutes; override with `OPENAI_ASR_CHUNK_SECONDS` if needed.
 - Metadata (title/description) is fetched via the official YouTube Data API to help infer speakers.
 - The Chrome extension talks to `http://127.0.0.1:8765`.
 - The extension displays YouTube-style bottom-left toast notifications for request feedback.
