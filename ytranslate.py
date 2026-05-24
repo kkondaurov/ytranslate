@@ -1835,6 +1835,87 @@ def chunk_source_turns(turns: List[Dict[str, str]], max_chars: int) -> List[List
     return chunks
 
 
+class TurnTextAlignmentError(RuntimeError):
+    pass
+
+
+def max_plausible_output_chars(source_chars: int) -> int:
+    if source_chars <= 30:
+        return 180
+    if source_chars <= 120:
+        return source_chars * 5 + 200
+    return max(source_chars * 6, source_chars + 800)
+
+
+def min_plausible_output_chars(source_chars: int) -> int:
+    if source_chars < 400:
+        return 0
+    return max(40, int(source_chars * 0.08))
+
+
+def validate_turn_text_alignment_by_length(
+    source_turns: List[Dict[str, str]],
+    output_texts: List[str],
+    source_field: str,
+    pass_name: str,
+) -> None:
+    if len(source_turns) != len(output_texts):
+        raise TurnTextAlignmentError(
+            f"{pass_name} returned {len(output_texts)} texts for {len(source_turns)} turns"
+        )
+
+    for index, (turn, output_text) in enumerate(zip(source_turns, output_texts), 1):
+        source_text = (turn.get(source_field) or "").strip()
+        output_text = (output_text or "").strip()
+        source_chars = len(source_text)
+        output_chars = len(output_text)
+        if source_chars == 0:
+            continue
+
+        max_chars = max_plausible_output_chars(source_chars)
+        if output_chars > max_chars:
+            raise TurnTextAlignmentError(
+                f"{pass_name} turn {index} expanded from {source_chars} to {output_chars} chars"
+            )
+
+        min_chars = min_plausible_output_chars(source_chars)
+        if output_chars < min_chars:
+            raise TurnTextAlignmentError(
+                f"{pass_name} turn {index} shrank from {source_chars} to {output_chars} chars"
+            )
+
+
+def run_turn_text_pass_with_alignment_retry(
+    turns: List[Dict[str, str]],
+    source_field: str,
+    pass_name: str,
+    run_chunk: Callable[[List[Dict[str, str]]], List[str]],
+) -> List[str]:
+    output_texts = run_chunk(turns)
+    try:
+        validate_turn_text_alignment_by_length(turns, output_texts, source_field, pass_name)
+        return output_texts
+    except TurnTextAlignmentError:
+        if len(turns) <= 1:
+            raise
+
+    split_at = max(1, len(turns) // 2)
+    return (
+        run_turn_text_pass_with_alignment_retry(
+            turns[:split_at],
+            source_field,
+            pass_name,
+            run_chunk,
+        )
+        + run_turn_text_pass_with_alignment_retry(
+            turns[split_at:],
+            source_field,
+            pass_name,
+            run_chunk,
+        )
+    )
+
+
 def translate_turn_chunk(
     client: OpenAI,
     model: str,
@@ -1895,26 +1976,35 @@ def translate_attributed_turns(
     translated_turns: List[Dict[str, str]] = []
     title_translated = ""
     for chunk_index, chunk in enumerate(chunks, 1):
-        result = translate_turn_chunk(
-            client,
-            model,
-            url,
-            title,
-            description,
-            target_language,
-            speakers,
+        def run_chunk(retry_chunk: List[Dict[str, str]]) -> List[str]:
+            nonlocal title_translated
+            result = translate_turn_chunk(
+                client,
+                model,
+                url,
+                title,
+                description,
+                target_language,
+                speakers,
+                retry_chunk,
+                source_language_hint,
+                debug_sink=debug_sink,
+                chunk_index=chunk_index,
+                chunk_count=len(chunks),
+            )
+            if not title_translated:
+                title_translated = result.get("title_translated", "")
+            return align_turn_texts_by_index(
+                result.get("turns", []),
+                len(retry_chunk),
+                f"Translation chunk {chunk_index}",
+            )
+
+        translated_texts = run_turn_text_pass_with_alignment_retry(
             chunk,
-            source_language_hint,
-            debug_sink=debug_sink,
-            chunk_index=chunk_index,
-            chunk_count=len(chunks),
-        )
-        if not title_translated:
-            title_translated = result.get("title_translated", "")
-        translated_texts = align_turn_texts_by_index(
-            result.get("turns", []),
-            len(chunk),
+            "text_source",
             f"Translation chunk {chunk_index}",
+            run_chunk,
         )
         translated_turns.extend(
             {
@@ -2085,15 +2175,23 @@ def cleanup_russian_turns(
     cleaned_texts = []
     chunks = chunk_turns_by_chars(turns, max_chars=TURN_TEXT_PASS_MAX_CHARS)
     for chunk_index, chunk in enumerate(chunks, 1):
-        cleaned_texts.extend(
-            cleanup_russian_turn_chunk(
+        def run_chunk(retry_chunk: List[Dict[str, str]]) -> List[str]:
+            return cleanup_russian_turn_chunk(
                 client,
                 model,
                 title_translated,
-                chunk,
+                retry_chunk,
                 chunk_index=chunk_index,
                 chunk_count=len(chunks),
                 debug_sink=debug_sink,
+            )
+
+        cleaned_texts.extend(
+            run_turn_text_pass_with_alignment_retry(
+                chunk,
+                "text_translated",
+                f"Cleanup chunk {chunk_index}",
+                run_chunk,
             )
         )
 
@@ -2152,15 +2250,23 @@ def annotate_russian_turns(
     annotated_texts = []
     chunks = chunk_turns_by_chars(turns, max_chars=TURN_TEXT_PASS_MAX_CHARS)
     for chunk_index, chunk in enumerate(chunks, 1):
-        annotated_texts.extend(
-            annotate_russian_turn_chunk(
+        def run_chunk(retry_chunk: List[Dict[str, str]]) -> List[str]:
+            return annotate_russian_turn_chunk(
                 client,
                 model,
                 title_translated,
-                chunk,
+                retry_chunk,
                 chunk_index=chunk_index,
                 chunk_count=len(chunks),
                 debug_sink=debug_sink,
+            )
+
+        annotated_texts.extend(
+            run_turn_text_pass_with_alignment_retry(
+                chunk,
+                "text_translated",
+                f"Annotation chunk {chunk_index}",
+                run_chunk,
             )
         )
 
