@@ -891,59 +891,6 @@ def load_speaker_mapping_overrides(
     return combined if found else None
 
 
-def looks_like_sentence_continuation(text: str) -> bool:
-    stripped = clean_segment_text(text)
-    return bool(stripped) and stripped[0].islower()
-
-
-def apply_chunk_boundary_speaker_continuity(
-    speaker_mapping: Dict[str, Any],
-    segments: List[Dict[str, Any]],
-    max_gap_seconds: float = 2.0,
-) -> Dict[str, Any]:
-    mapping_by_local = {
-        (int(item.get("chunk_index") or 0), str(item.get("local_speaker") or "speaker")): item.get("speaker_id")
-        for item in speaker_mapping.get("local_speakers", [])
-    }
-    overrides: List[Dict[str, Any]] = []
-    ordered_segments = sorted(
-        segments,
-        key=lambda segment: float(segment.get("start") or 0),
-    )
-
-    for previous, current in zip(ordered_segments, ordered_segments[1:]):
-        previous_chunk = int(previous.get("chunk_index") or 0)
-        current_chunk = int(current.get("chunk_index") or 0)
-        if not previous_chunk or not current_chunk or previous_chunk == current_chunk:
-            continue
-
-        previous_end = float(previous.get("end") or previous.get("start") or 0)
-        current_start = float(current.get("start") or 0)
-        if current_start - previous_end > max_gap_seconds:
-            continue
-        if not looks_like_sentence_continuation(str(current.get("text") or "")):
-            continue
-
-        previous_local = str(previous.get("local_speaker") or previous.get("speaker") or "speaker")
-        current_local = str(current.get("local_speaker") or current.get("speaker") or "speaker")
-        previous_speaker_id = mapping_by_local.get((previous_chunk, previous_local))
-        current_speaker_id = mapping_by_local.get((current_chunk, current_local))
-        if not previous_speaker_id or not current_speaker_id or previous_speaker_id == current_speaker_id:
-            continue
-
-        overrides.append(
-            {
-                "chunk_index": current_chunk,
-                "local_speaker": current_local,
-                "speaker_id": previous_speaker_id,
-            }
-        )
-
-    if not overrides:
-        return speaker_mapping
-    return apply_speaker_mapping_overrides(speaker_mapping, {"local_speakers": overrides})
-
-
 def get_speaker_mapping_by_local(speaker_mapping: Optional[Dict[str, Any]]) -> Dict[Any, str]:
     if not speaker_mapping:
         return {}
@@ -3026,10 +2973,6 @@ def run_translation_job(
             asr_result.get("segments", []),
             source_language_hint,
             debug_sink=speaker_pass_debug if debug else None,
-        )
-        speaker_mapping = apply_chunk_boundary_speaker_continuity(
-            speaker_mapping,
-            asr_result.get("segments", []),
         )
         speaker_overrides = load_speaker_mapping_overrides(video_id)
         if speaker_overrides:

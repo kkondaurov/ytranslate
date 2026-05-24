@@ -263,40 +263,6 @@ class DiarizedAsrTests(unittest.TestCase):
 
         self.assertEqual(effective["local_speakers"][0]["speaker_id"], "speaker_chamath")
 
-    def test_chunk_boundary_continuity_remaps_new_chunk_mid_sentence_speaker(self):
-        segments = [
-            {
-                "chunk_index": 1,
-                "local_speaker": "D",
-                "speaker": "D",
-                "start": 1189.27,
-                "end": 1199.82,
-                "text": "gave everyone skepticism about.",
-            },
-            {
-                "chunk_index": 2,
-                "local_speaker": "A",
-                "speaker": "A",
-                "start": 1200.02,
-                "end": 1201.47,
-                "text": "technology and science generally,",
-            },
-        ]
-        speaker_mapping = {
-            "speakers": [
-                {"id": "speaker_jason", "label_short": "Jason", "label_full": "Jason"},
-                {"id": "speaker_friedberg", "label_short": "Friedberg", "label_full": "Friedberg"},
-            ],
-            "local_speakers": [
-                {"chunk_index": 1, "local_speaker": "D", "speaker_id": "speaker_friedberg"},
-                {"chunk_index": 2, "local_speaker": "A", "speaker_id": "speaker_jason"},
-            ],
-        }
-
-        effective = ytranslate.apply_chunk_boundary_speaker_continuity(speaker_mapping, segments)
-
-        self.assertEqual(effective["local_speakers"][1]["speaker_id"], "speaker_friedberg")
-
     def test_voice_reconciliation_can_override_mixed_local_speaker_segments(self):
         segments = [
             {"chunk_index": 1, "local_speaker": "A", "speaker": "A", "start": 0, "end": 8, "text": "Alice anchor."},
