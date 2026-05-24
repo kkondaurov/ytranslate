@@ -512,14 +512,13 @@ class TurnTextAlignmentTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing turn_index"):
             ytranslate.align_turn_texts_by_index(returned_turns, 2, "translation")
 
-    def test_translate_attributed_turns_preserves_speaker_ids_when_model_reorders_results(self):
+    def test_translate_attributed_turns_preserves_turn_order_when_model_reorders_results(self):
         turns = [
             {"speaker_id": "speaker_a", "text_source": "Alpha."},
-            {"speaker_id": "speaker_b", "text_source": "Beta."},
+            {"speaker_id": "speaker_a", "text_source": "Beta."},
         ]
         speakers = [
             {"id": "speaker_a", "label_short": "A", "label_full": "A"},
-            {"id": "speaker_b", "label_short": "B", "label_full": "B"},
         ]
         result_from_model = {
             "title_translated": "Title",
@@ -546,7 +545,7 @@ class TurnTextAlignmentTests(unittest.TestCase):
             result["turns"],
             [
                 {"speaker_id": "speaker_a", "text_translated": "Альфа."},
-                {"speaker_id": "speaker_b", "text_translated": "Бета."},
+                {"speaker_id": "speaker_a", "text_translated": "Бета."},
             ],
         )
 
@@ -606,18 +605,28 @@ class TurnTextAlignmentTests(unittest.TestCase):
             ["speaker_a", "speaker_b", "speaker_c"],
         )
 
-    def test_translate_attributed_turns_retries_chunk_when_text_moves_to_wrong_turn(self):
+    def test_source_turn_chunks_group_by_speaker(self):
         turns = [
-            {
-                "speaker_id": "speaker_friedberg",
-                "text_source": "This is a long answer about technology backlash. " * 20,
-            },
-            {"speaker_id": "speaker_chamath", "text_source": "Do you think we should slow down?"},
+            {"speaker_id": "speaker_friedberg", "text_source": "Friedberg first."},
+            {"speaker_id": "speaker_chamath", "text_source": "Chamath interjection."},
+            {"speaker_id": "speaker_friedberg", "text_source": "Friedberg continues."},
+        ]
+
+        chunks = ytranslate.chunk_source_turns(turns, max_chars=10_000)
+
+        self.assertEqual(chunks, [[turns[0], turns[2]], [turns[1]]])
+
+    def test_translate_attributed_turns_reassembles_speaker_grouped_chunks_in_original_order(self):
+        turns = [
+            {"speaker_id": "speaker_friedberg", "text_source": "Friedberg first."},
+            {"speaker_id": "speaker_chamath", "text_source": "Chamath interjection."},
+            {"speaker_id": "speaker_friedberg", "text_source": "Friedberg continues."},
         ]
         speakers = [
             {"id": "speaker_friedberg", "label_short": "Friedberg", "label_full": "David Friedberg"},
             {"id": "speaker_chamath", "label_short": "Chamath", "label_full": "Chamath Palihapitiya"},
         ]
+        seen_chunks = []
 
         def fake_translate_chunk(
             _client,
@@ -633,25 +642,16 @@ class TurnTextAlignmentTests(unittest.TestCase):
             chunk_index=1,
             chunk_count=1,
         ):
-            if len(chunk) > 1:
-                return {
-                    "title_translated": "Заголовок",
-                    "turns": [
-                        {"turn_index": 1, "text_translated": "Короткий обрывок."},
-                        {"turn_index": 2, "text_translated": "Ошибочно перенесенный длинный ответ. " * 80},
-                    ],
-                }
+            seen_chunks.append([turn["speaker_id"] for turn in chunk])
             return {
-                "title_translated": "Заголовок",
+                "title_translated": "Title",
                 "turns": [
-                    {
-                        "turn_index": 1,
-                        "text_translated": f"ok:{chunk[0]['speaker_id']} " + ("перевод " * 30).strip(),
-                    }
+                    {"turn_index": index, "text_translated": f"translated:{turn['text_source']}"}
+                    for index, turn in enumerate(chunk, 1)
                 ],
             }
 
-        with patch.object(ytranslate, "translate_turn_chunk", side_effect=fake_translate_chunk) as chunk_mock:
+        with patch.object(ytranslate, "translate_turn_chunk", side_effect=fake_translate_chunk):
             result = ytranslate.translate_attributed_turns(
                 client=Mock(),
                 model="model",
@@ -664,12 +664,19 @@ class TurnTextAlignmentTests(unittest.TestCase):
                 source_language_hint=None,
             )
 
-        self.assertEqual(chunk_mock.call_count, 3)
+        self.assertEqual(
+            seen_chunks,
+            [
+                ["speaker_friedberg", "speaker_friedberg"],
+                ["speaker_chamath"],
+            ],
+        )
         self.assertEqual(
             result["turns"],
             [
-                {"speaker_id": "speaker_friedberg", "text_translated": "ok:speaker_friedberg " + ("перевод " * 30).strip()},
-                {"speaker_id": "speaker_chamath", "text_translated": "ok:speaker_chamath " + ("перевод " * 30).strip()},
+                {"speaker_id": "speaker_friedberg", "text_translated": "translated:Friedberg first."},
+                {"speaker_id": "speaker_chamath", "text_translated": "translated:Chamath interjection."},
+                {"speaker_id": "speaker_friedberg", "text_translated": "translated:Friedberg continues."},
             ],
         )
 
@@ -708,11 +715,24 @@ class TurnTextAlignmentTests(unittest.TestCase):
             ["speaker_a", "speaker_b", "speaker_c"],
         )
 
-    def test_cleanup_russian_turns_retries_chunk_when_text_moves_to_wrong_turn(self):
+    def test_translated_turn_chunks_group_by_speaker(self):
         turns = [
-            {"speaker_id": "speaker_friedberg", "text_translated": "длинный ответ " * 80},
-            {"speaker_id": "speaker_chamath", "text_translated": "короткий вопрос"},
+            {"speaker_id": "speaker_friedberg", "text_translated": "Фридберг начал."},
+            {"speaker_id": "speaker_chamath", "text_translated": "Чамат перебил."},
+            {"speaker_id": "speaker_friedberg", "text_translated": "Фридберг продолжил."},
         ]
+
+        chunks = ytranslate.chunk_turns_by_chars(turns, max_chars=10_000)
+
+        self.assertEqual(chunks, [[turns[0], turns[2]], [turns[1]]])
+
+    def test_cleanup_russian_turns_reassembles_speaker_grouped_chunks_in_original_order(self):
+        turns = [
+            {"speaker_id": "speaker_friedberg", "text_translated": "Фридберг начал."},
+            {"speaker_id": "speaker_chamath", "text_translated": "Чамат перебил."},
+            {"speaker_id": "speaker_friedberg", "text_translated": "Фридберг продолжил."},
+        ]
+        seen_chunks = []
 
         def fake_cleanup_chunk(
             _client,
@@ -723,13 +743,10 @@ class TurnTextAlignmentTests(unittest.TestCase):
             chunk_count=1,
             debug_sink=None,
         ):
-            if len(chunk) > 1:
-                return ["обрывок", "ошибочно перенесенный длинный ответ " * 80]
-            if len(chunk[0]["text_translated"]) > 100:
-                return [f"ok:{chunk[0]['speaker_id']} " + ("текст " * 30).strip()]
-            return [f"ok:{chunk[0]['speaker_id']}"]
+            seen_chunks.append([turn["speaker_id"] for turn in chunk])
+            return [f"cleaned:{turn['text_translated']}" for turn in chunk]
 
-        with patch.object(ytranslate, "cleanup_russian_turn_chunk", side_effect=fake_cleanup_chunk) as chunk_mock:
+        with patch.object(ytranslate, "cleanup_russian_turn_chunk", side_effect=fake_cleanup_chunk):
             result = ytranslate.cleanup_russian_turns(
                 client=Mock(),
                 model="model",
@@ -737,12 +754,19 @@ class TurnTextAlignmentTests(unittest.TestCase):
                 turns=turns,
             )
 
-        self.assertEqual(chunk_mock.call_count, 3)
+        self.assertEqual(
+            seen_chunks,
+            [
+                ["speaker_friedberg", "speaker_friedberg"],
+                ["speaker_chamath"],
+            ],
+        )
         self.assertEqual(
             result,
             [
-                {"speaker_id": "speaker_friedberg", "text_translated": "ok:speaker_friedberg " + ("текст " * 30).strip()},
-                {"speaker_id": "speaker_chamath", "text_translated": "ok:speaker_chamath"},
+                {"speaker_id": "speaker_friedberg", "text_translated": "cleaned:Фридберг начал."},
+                {"speaker_id": "speaker_chamath", "text_translated": "cleaned:Чамат перебил."},
+                {"speaker_id": "speaker_friedberg", "text_translated": "cleaned:Фридберг продолжил."},
             ],
         )
 
@@ -779,44 +803,6 @@ class TurnTextAlignmentTests(unittest.TestCase):
         self.assertEqual(
             [turn["speaker_id"] for turn in result],
             ["speaker_a", "speaker_b", "speaker_c"],
-        )
-
-    def test_annotate_russian_turns_retries_chunk_when_text_moves_to_wrong_turn(self):
-        turns = [
-            {"speaker_id": "speaker_friedberg", "text_translated": "длинный ответ " * 80},
-            {"speaker_id": "speaker_chamath", "text_translated": "короткий вопрос"},
-        ]
-
-        def fake_annotate_chunk(
-            _client,
-            _model,
-            _title_translated,
-            chunk,
-            chunk_index=1,
-            chunk_count=1,
-            debug_sink=None,
-        ):
-            if len(chunk) > 1:
-                return ["обрывок", "ошибочно перенесенный длинный ответ " * 80]
-            if len(chunk[0]["text_translated"]) > 100:
-                return [f"ok:{chunk[0]['speaker_id']} " + ("текст " * 30).strip()]
-            return [f"ok:{chunk[0]['speaker_id']}"]
-
-        with patch.object(ytranslate, "annotate_russian_turn_chunk", side_effect=fake_annotate_chunk) as chunk_mock:
-            result = ytranslate.annotate_russian_turns(
-                client=Mock(),
-                model="model",
-                title_translated="Title",
-                turns=turns,
-            )
-
-        self.assertEqual(chunk_mock.call_count, 3)
-        self.assertEqual(
-            result,
-            [
-                {"speaker_id": "speaker_friedberg", "text_translated": "ok:speaker_friedberg " + ("текст " * 30).strip()},
-                {"speaker_id": "speaker_chamath", "text_translated": "ok:speaker_chamath"},
-            ],
         )
 
     def test_cleanup_russian_turn_chunk_aligns_returned_texts_by_turn_index(self):

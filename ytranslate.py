@@ -1817,103 +1817,39 @@ def call_openai_with_retry(
             raise
 
 
-def chunk_source_turns(turns: List[Dict[str, str]], max_chars: int) -> List[List[Dict[str, str]]]:
-    chunks: List[List[Dict[str, str]]] = []
-    current: List[Dict[str, str]] = []
-    current_chars = 0
-    for turn in turns:
-        line_len = len(turn.get("text_source", "")) + len(turn.get("speaker_id", "")) + 8
-        if current and current_chars + line_len > max_chars:
-            chunks.append(current)
-            current = [turn]
-            current_chars = line_len
-        else:
-            current.append(turn)
-            current_chars += line_len
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-class TurnTextAlignmentError(RuntimeError):
-    pass
-
-
-def max_plausible_output_chars(source_chars: int) -> int:
-    if source_chars <= 30:
-        return 180
-    if source_chars <= 120:
-        return source_chars * 5 + 200
-    return max(source_chars * 6, source_chars + 800)
-
-
-def min_plausible_output_chars(source_chars: int) -> int:
-    if source_chars < 400:
-        return 0
-    return max(40, int(source_chars * 0.08))
-
-
-def validate_turn_text_alignment_by_length(
-    source_turns: List[Dict[str, str]],
-    output_texts: List[str],
-    source_field: str,
-    pass_name: str,
-) -> None:
-    if len(source_turns) != len(output_texts):
-        raise TurnTextAlignmentError(
-            f"{pass_name} returned {len(output_texts)} texts for {len(source_turns)} turns"
-        )
-
-    for index, (turn, output_text) in enumerate(zip(source_turns, output_texts), 1):
-        source_text = (turn.get(source_field) or "").strip()
-        output_text = (output_text or "").strip()
-        source_chars = len(source_text)
-        output_chars = len(output_text)
-        if source_chars == 0:
-            continue
-
-        max_chars = max_plausible_output_chars(source_chars)
-        if output_chars > max_chars:
-            raise TurnTextAlignmentError(
-                f"{pass_name} turn {index} expanded from {source_chars} to {output_chars} chars"
-            )
-
-        min_chars = min_plausible_output_chars(source_chars)
-        if output_chars < min_chars:
-            raise TurnTextAlignmentError(
-                f"{pass_name} turn {index} shrank from {source_chars} to {output_chars} chars"
-            )
-
-
-def run_turn_text_pass_with_alignment_retry(
+def chunk_turns_by_speaker_and_chars(
     turns: List[Dict[str, str]],
-    source_field: str,
-    pass_name: str,
-    run_chunk: Callable[[List[Dict[str, str]]], List[str]],
-) -> List[str]:
-    output_texts = run_chunk(turns)
-    try:
-        validate_turn_text_alignment_by_length(turns, output_texts, source_field, pass_name)
-        return output_texts
-    except TurnTextAlignmentError:
-        if len(turns) <= 1:
-            raise
+    text_field: str,
+    max_chars: int,
+) -> List[List[Dict[str, str]]]:
+    speaker_order: List[str] = []
+    chunks_by_speaker: Dict[str, List[List[Dict[str, str]]]] = {}
+    chars_by_speaker: Dict[str, List[int]] = {}
+    for turn in turns:
+        speaker_id = turn.get("speaker_id") or "speaker"
+        if speaker_id not in chunks_by_speaker:
+            speaker_order.append(speaker_id)
+            chunks_by_speaker[speaker_id] = [[]]
+            chars_by_speaker[speaker_id] = [0]
 
-    split_at = max(1, len(turns) // 2)
-    return (
-        run_turn_text_pass_with_alignment_retry(
-            turns[:split_at],
-            source_field,
-            pass_name,
-            run_chunk,
-        )
-        + run_turn_text_pass_with_alignment_retry(
-            turns[split_at:],
-            source_field,
-            pass_name,
-            run_chunk,
-        )
-    )
+        chunks = chunks_by_speaker[speaker_id]
+        chunk_chars = chars_by_speaker[speaker_id]
+        line_len = len(turn.get(text_field, "")) + len(speaker_id) + 8
+        if chunks[-1] and chunk_chars[-1] + line_len > max_chars:
+            chunks.append([turn])
+            chunk_chars.append(line_len)
+        else:
+            chunks[-1].append(turn)
+            chunk_chars[-1] += line_len
+
+    ordered_chunks: List[List[Dict[str, str]]] = []
+    for speaker_id in speaker_order:
+        ordered_chunks.extend(chunks_by_speaker[speaker_id])
+    return ordered_chunks
+
+
+def chunk_source_turns(turns: List[Dict[str, str]], max_chars: int) -> List[List[Dict[str, str]]]:
+    return chunk_turns_by_speaker_and_chars(turns, "text_source", max_chars)
 
 
 def translate_turn_chunk(
@@ -1973,51 +1909,44 @@ def translate_attributed_turns(
     debug_sink: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     chunks = chunk_source_turns(turns, max_chars=TURN_TEXT_PASS_MAX_CHARS)
-    translated_turns: List[Dict[str, str]] = []
+    translated_texts_by_turn: List[str] = [""] * len(turns)
+    turn_positions = {id(turn): index for index, turn in enumerate(turns)}
     title_translated = ""
     for chunk_index, chunk in enumerate(chunks, 1):
-        def run_chunk(retry_chunk: List[Dict[str, str]]) -> List[str]:
-            nonlocal title_translated
-            result = translate_turn_chunk(
-                client,
-                model,
-                url,
-                title,
-                description,
-                target_language,
-                speakers,
-                retry_chunk,
-                source_language_hint,
-                debug_sink=debug_sink,
-                chunk_index=chunk_index,
-                chunk_count=len(chunks),
-            )
-            if not title_translated:
-                title_translated = result.get("title_translated", "")
-            return align_turn_texts_by_index(
-                result.get("turns", []),
-                len(retry_chunk),
-                f"Translation chunk {chunk_index}",
-            )
-
-        translated_texts = run_turn_text_pass_with_alignment_retry(
+        result = translate_turn_chunk(
+            client,
+            model,
+            url,
+            title,
+            description,
+            target_language,
+            speakers,
             chunk,
-            "text_source",
+            source_language_hint,
+            debug_sink=debug_sink,
+            chunk_index=chunk_index,
+            chunk_count=len(chunks),
+        )
+        if not title_translated:
+            title_translated = result.get("title_translated", "")
+        translated_texts = align_turn_texts_by_index(
+            result.get("turns", []),
+            len(chunk),
             f"Translation chunk {chunk_index}",
-            run_chunk,
         )
-        translated_turns.extend(
-            {
-                "speaker_id": turn.get("speaker_id"),
-                "text_translated": translated_text,
-            }
-            for turn, translated_text in zip(chunk, translated_texts)
-        )
+        for turn, translated_text in zip(chunk, translated_texts):
+            translated_texts_by_turn[turn_positions[id(turn)]] = translated_text
 
     return {
         "title_translated": title_translated,
         "speakers": speakers,
-        "turns": translated_turns,
+        "turns": [
+            {
+                "speaker_id": turn.get("speaker_id"),
+                "text_translated": translated_text,
+            }
+            for turn, translated_text in zip(turns, translated_texts_by_turn)
+        ],
     }
 
 
@@ -2112,21 +2041,7 @@ def build_russian_annotation_user_prompt(
 
 
 def chunk_turns_by_chars(turns: List[Dict[str, str]], max_chars: int) -> List[List[Dict[str, str]]]:
-    chunks: List[List[Dict[str, str]]] = []
-    current: List[Dict[str, str]] = []
-    current_chars = 0
-    for turn in turns:
-        line_len = len(turn.get("text_translated", "")) + len(turn.get("speaker_id", "")) + 8
-        if current and current_chars + line_len > max_chars:
-            chunks.append(current)
-            current = [turn]
-            current_chars = line_len
-        else:
-            current.append(turn)
-            current_chars += line_len
-    if current:
-        chunks.append(current)
-    return chunks
+    return chunk_turns_by_speaker_and_chars(turns, "text_translated", max_chars)
 
 
 def cleanup_russian_turn_chunk(
@@ -2172,28 +2087,21 @@ def cleanup_russian_turns(
     if not turns:
         return turns
 
-    cleaned_texts = []
+    cleaned_texts = [""] * len(turns)
+    turn_positions = {id(turn): index for index, turn in enumerate(turns)}
     chunks = chunk_turns_by_chars(turns, max_chars=TURN_TEXT_PASS_MAX_CHARS)
     for chunk_index, chunk in enumerate(chunks, 1):
-        def run_chunk(retry_chunk: List[Dict[str, str]]) -> List[str]:
-            return cleanup_russian_turn_chunk(
-                client,
-                model,
-                title_translated,
-                retry_chunk,
-                chunk_index=chunk_index,
-                chunk_count=len(chunks),
-                debug_sink=debug_sink,
-            )
-
-        cleaned_texts.extend(
-            run_turn_text_pass_with_alignment_retry(
-                chunk,
-                "text_translated",
-                f"Cleanup chunk {chunk_index}",
-                run_chunk,
-            )
+        chunk_texts = cleanup_russian_turn_chunk(
+            client,
+            model,
+            title_translated,
+            chunk,
+            chunk_index=chunk_index,
+            chunk_count=len(chunks),
+            debug_sink=debug_sink,
         )
+        for turn, cleaned_text in zip(chunk, chunk_texts):
+            cleaned_texts[turn_positions[id(turn)]] = cleaned_text
 
     if len(cleaned_texts) != len(turns):
         raise RuntimeError("Cleanup pass returned the wrong number of turns")
@@ -2247,28 +2155,21 @@ def annotate_russian_turns(
     if not turns:
         return turns
 
-    annotated_texts = []
+    annotated_texts = [""] * len(turns)
+    turn_positions = {id(turn): index for index, turn in enumerate(turns)}
     chunks = chunk_turns_by_chars(turns, max_chars=TURN_TEXT_PASS_MAX_CHARS)
     for chunk_index, chunk in enumerate(chunks, 1):
-        def run_chunk(retry_chunk: List[Dict[str, str]]) -> List[str]:
-            return annotate_russian_turn_chunk(
-                client,
-                model,
-                title_translated,
-                retry_chunk,
-                chunk_index=chunk_index,
-                chunk_count=len(chunks),
-                debug_sink=debug_sink,
-            )
-
-        annotated_texts.extend(
-            run_turn_text_pass_with_alignment_retry(
-                chunk,
-                "text_translated",
-                f"Annotation chunk {chunk_index}",
-                run_chunk,
-            )
+        chunk_texts = annotate_russian_turn_chunk(
+            client,
+            model,
+            title_translated,
+            chunk,
+            chunk_index=chunk_index,
+            chunk_count=len(chunks),
+            debug_sink=debug_sink,
         )
+        for turn, annotated_text in zip(chunk, chunk_texts):
+            annotated_texts[turn_positions[id(turn)]] = annotated_text
 
     if len(annotated_texts) != len(turns):
         raise RuntimeError("Annotation pass returned the wrong number of turns")
