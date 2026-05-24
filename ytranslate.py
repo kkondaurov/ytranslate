@@ -47,6 +47,7 @@ DOCX_HEADING_FONT_SIZE = Pt(16)
 OUTPUT_DIR = os.path.expanduser("~/Downloads")
 CACHE_DIR = os.path.expanduser("~/Library/Caches/ytranslate")
 SPEAKER_OVERRIDES_FILENAME = "speaker-overrides.json"
+TURN_TEXT_PASS_MAX_CHARS = 12_000
 
 
 def parse_args() -> argparse.Namespace:
@@ -877,6 +878,59 @@ def load_speaker_mapping_overrides(
         found = True
 
     return combined if found else None
+
+
+def looks_like_sentence_continuation(text: str) -> bool:
+    stripped = clean_segment_text(text)
+    return bool(stripped) and stripped[0].islower()
+
+
+def apply_chunk_boundary_speaker_continuity(
+    speaker_mapping: Dict[str, Any],
+    segments: List[Dict[str, Any]],
+    max_gap_seconds: float = 2.0,
+) -> Dict[str, Any]:
+    mapping_by_local = {
+        (int(item.get("chunk_index") or 0), str(item.get("local_speaker") or "speaker")): item.get("speaker_id")
+        for item in speaker_mapping.get("local_speakers", [])
+    }
+    overrides: List[Dict[str, Any]] = []
+    ordered_segments = sorted(
+        segments,
+        key=lambda segment: float(segment.get("start") or 0),
+    )
+
+    for previous, current in zip(ordered_segments, ordered_segments[1:]):
+        previous_chunk = int(previous.get("chunk_index") or 0)
+        current_chunk = int(current.get("chunk_index") or 0)
+        if not previous_chunk or not current_chunk or previous_chunk == current_chunk:
+            continue
+
+        previous_end = float(previous.get("end") or previous.get("start") or 0)
+        current_start = float(current.get("start") or 0)
+        if current_start - previous_end > max_gap_seconds:
+            continue
+        if not looks_like_sentence_continuation(str(current.get("text") or "")):
+            continue
+
+        previous_local = str(previous.get("local_speaker") or previous.get("speaker") or "speaker")
+        current_local = str(current.get("local_speaker") or current.get("speaker") or "speaker")
+        previous_speaker_id = mapping_by_local.get((previous_chunk, previous_local))
+        current_speaker_id = mapping_by_local.get((current_chunk, current_local))
+        if not previous_speaker_id or not current_speaker_id or previous_speaker_id == current_speaker_id:
+            continue
+
+        overrides.append(
+            {
+                "chunk_index": current_chunk,
+                "local_speaker": current_local,
+                "speaker_id": previous_speaker_id,
+            }
+        )
+
+    if not overrides:
+        return speaker_mapping
+    return apply_speaker_mapping_overrides(speaker_mapping, {"local_speakers": overrides})
 
 
 def attributed_turns_from_diarized_segments(
@@ -1861,40 +1915,7 @@ def translate_attributed_turns(
     source_language_hint: Optional[str],
     debug_sink: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    try:
-        result = translate_turn_chunk(
-            client,
-            model,
-            url,
-            title,
-            description,
-            target_language,
-            speakers,
-            turns,
-            source_language_hint,
-            debug_sink=debug_sink,
-        )
-        translated_texts = align_turn_texts_by_index(
-            result.get("turns", []),
-            len(turns),
-            "Translation",
-        )
-        return {
-            "title_translated": result.get("title_translated", ""),
-            "speakers": speakers,
-            "turns": [
-                {
-                    "speaker_id": turn.get("speaker_id"),
-                    "text_translated": translated_text,
-                }
-                for turn, translated_text in zip(turns, translated_texts)
-            ],
-        }
-    except Exception as exc:
-        if not (is_context_length_error(exc) or is_request_too_large_error(exc)):
-            raise
-
-    chunks = chunk_source_turns(turns, max_chars=60_000)
+    chunks = chunk_source_turns(turns, max_chars=TURN_TEXT_PASS_MAX_CHARS)
     translated_turns: List[Dict[str, str]] = []
     title_translated = ""
     for chunk_index, chunk in enumerate(chunks, 1):
@@ -2187,31 +2208,20 @@ def cleanup_russian_turns(
     if not turns:
         return turns
 
-    try:
-        cleaned_texts = cleanup_russian_turn_chunk(
-            client,
-            model,
-            title_translated,
-            turns,
-            debug_sink=debug_sink,
-        )
-    except Exception as exc:
-        if not (is_context_length_error(exc) or is_request_too_large_error(exc)):
-            raise
-        cleaned_texts = []
-        chunks = chunk_turns_by_chars(turns, max_chars=60_000)
-        for chunk_index, chunk in enumerate(chunks, 1):
-            cleaned_texts.extend(
-                cleanup_russian_turn_chunk(
-                    client,
-                    model,
-                    title_translated,
-                    chunk,
-                    chunk_index=chunk_index,
-                    chunk_count=len(chunks),
-                    debug_sink=debug_sink,
-                )
+    cleaned_texts = []
+    chunks = chunk_turns_by_chars(turns, max_chars=TURN_TEXT_PASS_MAX_CHARS)
+    for chunk_index, chunk in enumerate(chunks, 1):
+        cleaned_texts.extend(
+            cleanup_russian_turn_chunk(
+                client,
+                model,
+                title_translated,
+                chunk,
+                chunk_index=chunk_index,
+                chunk_count=len(chunks),
+                debug_sink=debug_sink,
             )
+        )
 
     if len(cleaned_texts) != len(turns):
         raise RuntimeError("Cleanup pass returned the wrong number of turns")
@@ -2265,31 +2275,20 @@ def annotate_russian_turns(
     if not turns:
         return turns
 
-    try:
-        annotated_texts = annotate_russian_turn_chunk(
-            client,
-            model,
-            title_translated,
-            turns,
-            debug_sink=debug_sink,
-        )
-    except Exception as exc:
-        if not (is_context_length_error(exc) or is_request_too_large_error(exc)):
-            raise
-        annotated_texts = []
-        chunks = chunk_turns_by_chars(turns, max_chars=60_000)
-        for chunk_index, chunk in enumerate(chunks, 1):
-            annotated_texts.extend(
-                annotate_russian_turn_chunk(
-                    client,
-                    model,
-                    title_translated,
-                    chunk,
-                    chunk_index=chunk_index,
-                    chunk_count=len(chunks),
-                    debug_sink=debug_sink,
-                )
+    annotated_texts = []
+    chunks = chunk_turns_by_chars(turns, max_chars=TURN_TEXT_PASS_MAX_CHARS)
+    for chunk_index, chunk in enumerate(chunks, 1):
+        annotated_texts.extend(
+            annotate_russian_turn_chunk(
+                client,
+                model,
+                title_translated,
+                chunk,
+                chunk_index=chunk_index,
+                chunk_count=len(chunks),
+                debug_sink=debug_sink,
             )
+        )
 
     if len(annotated_texts) != len(turns):
         raise RuntimeError("Annotation pass returned the wrong number of turns")
@@ -2591,6 +2590,10 @@ def run_translation_job(
             asr_result.get("segments", []),
             source_language_hint,
             debug_sink=speaker_pass_debug if debug else None,
+        )
+        speaker_mapping = apply_chunk_boundary_speaker_continuity(
+            speaker_mapping,
+            asr_result.get("segments", []),
         )
         speaker_overrides = load_speaker_mapping_overrides(video_id)
         if speaker_overrides:

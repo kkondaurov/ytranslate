@@ -422,6 +422,7 @@ def load_or_create_mapping(
     )
     if mapping_path.exists():
         mapping = read_json(mapping_path)
+        mapping = ytranslate.apply_chunk_boundary_speaker_continuity(mapping, segments)
         if overrides:
             mapping = ytranslate.apply_speaker_mapping_overrides(mapping, overrides)
             write_json(output_dir / "speaker-mapping-effective.json", mapping)
@@ -445,6 +446,7 @@ def load_or_create_mapping(
         debug_sink=debug_sink,
     )
     write_json(mapping_path, mapping)
+    mapping = ytranslate.apply_chunk_boundary_speaker_continuity(mapping, segments)
     if overrides:
         mapping = ytranslate.apply_speaker_mapping_overrides(mapping, overrides)
         write_json(output_dir / "speaker-mapping-effective.json", mapping)

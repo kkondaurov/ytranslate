@@ -263,6 +263,40 @@ class DiarizedAsrTests(unittest.TestCase):
 
         self.assertEqual(effective["local_speakers"][0]["speaker_id"], "speaker_chamath")
 
+    def test_chunk_boundary_continuity_remaps_new_chunk_mid_sentence_speaker(self):
+        segments = [
+            {
+                "chunk_index": 1,
+                "local_speaker": "D",
+                "speaker": "D",
+                "start": 1189.27,
+                "end": 1199.82,
+                "text": "gave everyone skepticism about.",
+            },
+            {
+                "chunk_index": 2,
+                "local_speaker": "A",
+                "speaker": "A",
+                "start": 1200.02,
+                "end": 1201.47,
+                "text": "technology and science generally,",
+            },
+        ]
+        speaker_mapping = {
+            "speakers": [
+                {"id": "speaker_jason", "label_short": "Jason", "label_full": "Jason"},
+                {"id": "speaker_friedberg", "label_short": "Friedberg", "label_full": "Friedberg"},
+            ],
+            "local_speakers": [
+                {"chunk_index": 1, "local_speaker": "D", "speaker_id": "speaker_friedberg"},
+                {"chunk_index": 2, "local_speaker": "A", "speaker_id": "speaker_jason"},
+            ],
+        }
+
+        effective = ytranslate.apply_chunk_boundary_speaker_continuity(speaker_mapping, segments)
+
+        self.assertEqual(effective["local_speakers"][1]["speaker_id"], "speaker_friedberg")
+
 
 class RunTranslationJobSourceChoiceTests(unittest.TestCase):
     def run_with_common_mocks(self, transcript_info, speaker_overrides=None):
@@ -448,6 +482,132 @@ class TurnTextAlignmentTests(unittest.TestCase):
                 {"speaker_id": "speaker_a", "text_translated": "Альфа."},
                 {"speaker_id": "speaker_b", "text_translated": "Бета."},
             ],
+        )
+
+    def test_translate_attributed_turns_chunks_before_calling_model(self):
+        turns = [
+            {"speaker_id": "speaker_a", "text_source": "Alpha " * 10},
+            {"speaker_id": "speaker_b", "text_source": "Beta " * 10},
+            {"speaker_id": "speaker_c", "text_source": "Gamma " * 10},
+        ]
+        speakers = [
+            {"id": "speaker_a", "label_short": "A", "label_full": "A"},
+            {"id": "speaker_b", "label_short": "B", "label_full": "B"},
+            {"id": "speaker_c", "label_short": "C", "label_full": "C"},
+        ]
+
+        def fake_translate_chunk(
+            _client,
+            _model,
+            _url,
+            _title,
+            _description,
+            _target_language,
+            _speakers,
+            chunk,
+            _source_language_hint,
+            debug_sink=None,
+            chunk_index=1,
+            chunk_count=1,
+        ):
+            return {
+                "title_translated": "Title",
+                "turns": [
+                    {"turn_index": index, "text_translated": turn["text_source"].strip()}
+                    for index, turn in enumerate(chunk, 1)
+                ],
+            }
+
+        with (
+            patch.object(ytranslate, "TURN_TEXT_PASS_MAX_CHARS", 70),
+            patch.object(ytranslate, "translate_turn_chunk", side_effect=fake_translate_chunk) as chunk_mock,
+        ):
+            result = ytranslate.translate_attributed_turns(
+                client=Mock(),
+                model="model",
+                url="https://youtu.be/test",
+                title="Title",
+                description="",
+                target_language="Russian",
+                speakers=speakers,
+                turns=turns,
+                source_language_hint=None,
+            )
+
+        self.assertGreater(chunk_mock.call_count, 1)
+        self.assertEqual(
+            [turn["speaker_id"] for turn in result["turns"]],
+            ["speaker_a", "speaker_b", "speaker_c"],
+        )
+
+    def test_cleanup_russian_turns_chunks_before_calling_model(self):
+        turns = [
+            {"speaker_id": "speaker_a", "text_translated": "первый " * 10},
+            {"speaker_id": "speaker_b", "text_translated": "второй " * 10},
+            {"speaker_id": "speaker_c", "text_translated": "третий " * 10},
+        ]
+
+        def fake_cleanup_chunk(
+            _client,
+            _model,
+            _title_translated,
+            chunk,
+            chunk_index=1,
+            chunk_count=1,
+            debug_sink=None,
+        ):
+            return [turn["text_translated"].strip() for turn in chunk]
+
+        with (
+            patch.object(ytranslate, "TURN_TEXT_PASS_MAX_CHARS", 80),
+            patch.object(ytranslate, "cleanup_russian_turn_chunk", side_effect=fake_cleanup_chunk) as chunk_mock,
+        ):
+            result = ytranslate.cleanup_russian_turns(
+                client=Mock(),
+                model="model",
+                title_translated="Title",
+                turns=turns,
+            )
+
+        self.assertGreater(chunk_mock.call_count, 1)
+        self.assertEqual(
+            [turn["speaker_id"] for turn in result],
+            ["speaker_a", "speaker_b", "speaker_c"],
+        )
+
+    def test_annotate_russian_turns_chunks_before_calling_model(self):
+        turns = [
+            {"speaker_id": "speaker_a", "text_translated": "первый " * 10},
+            {"speaker_id": "speaker_b", "text_translated": "второй " * 10},
+            {"speaker_id": "speaker_c", "text_translated": "третий " * 10},
+        ]
+
+        def fake_annotate_chunk(
+            _client,
+            _model,
+            _title_translated,
+            chunk,
+            chunk_index=1,
+            chunk_count=1,
+            debug_sink=None,
+        ):
+            return [turn["text_translated"].strip() for turn in chunk]
+
+        with (
+            patch.object(ytranslate, "TURN_TEXT_PASS_MAX_CHARS", 80),
+            patch.object(ytranslate, "annotate_russian_turn_chunk", side_effect=fake_annotate_chunk) as chunk_mock,
+        ):
+            result = ytranslate.annotate_russian_turns(
+                client=Mock(),
+                model="model",
+                title_translated="Title",
+                turns=turns,
+            )
+
+        self.assertGreater(chunk_mock.call_count, 1)
+        self.assertEqual(
+            [turn["speaker_id"] for turn in result],
+            ["speaker_a", "speaker_b", "speaker_c"],
         )
 
     def test_cleanup_russian_turn_chunk_aligns_returned_texts_by_turn_index(self):
