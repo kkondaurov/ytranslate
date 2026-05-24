@@ -25,8 +25,30 @@ pip install -r requirements.txt
 ```
 
 ## Usage
-### Recommended: local server + Chrome extension
-Start the local server:
+### Recommended: launchd-managed local server + Chrome extension
+Install and start the per-user macOS LaunchAgent:
+```bash
+scripts/install-launchagent.sh install
+```
+
+Check it:
+```bash
+curl http://127.0.0.1:8765/health
+scripts/install-launchagent.sh status
+```
+
+The LaunchAgent:
+- starts automatically at login
+- keeps the server running
+- runs from this checkout and reads the local `.env`
+- writes logs to `~/Library/Logs/ytranslate/server.log` and `~/Library/Logs/ytranslate/server.err.log`
+
+Stop and remove it:
+```bash
+scripts/install-launchagent.sh uninstall
+```
+
+For a foreground/manual server run:
 ```bash
 source .venv/bin/activate
 python ytranslate_server.py
@@ -40,7 +62,7 @@ extension/
 Then open a YouTube watch page. A compact `PDF` button is injected to the left of the like/dislike control. Clicking it queues the current video for processing on the local server.
 
 The server:
-- prints logs to the terminal
+- prints logs to the terminal when run manually
 - saves `.docx` and `.pdf` to `~/Downloads/`
 - shows a macOS desktop notification on completion
 
