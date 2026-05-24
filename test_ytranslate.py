@@ -4,6 +4,12 @@ from unittest.mock import Mock, patch
 import ytranslate
 
 
+class OpenAICallTests(unittest.TestCase):
+    def test_call_openai_requires_explicit_json_schema(self):
+        with self.assertRaisesRegex(RuntimeError, "JSON schema must be provided"):
+            ytranslate.call_openai(Mock(), "gpt-test", "system", "user")
+
+
 class TranscriptSourceTests(unittest.TestCase):
     def test_generated_speakerless_youtube_transcript_is_not_high_quality(self):
         transcript = {
