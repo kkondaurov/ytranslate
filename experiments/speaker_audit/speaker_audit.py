@@ -81,22 +81,43 @@ def build_mapping_lookup(speaker_mapping: Optional[Dict[str, Any]]) -> Dict[Any,
     return lookup
 
 
+def build_speaker_label_lookup(speaker_mapping: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    if not speaker_mapping:
+        return {}
+    return {
+        str(speaker.get("id")): {
+            "id": str(speaker.get("id")),
+            "label": str(speaker.get("label_short") or speaker.get("id")),
+            "label_full": str(speaker.get("label_full") or speaker.get("label_short") or speaker.get("id")),
+        }
+        for speaker in speaker_mapping.get("speakers", [])
+        if speaker.get("id")
+    }
+
+
 def build_audit_rows(
     asr_segments: List[Dict[str, Any]],
     speaker_mapping: Optional[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     mapping_lookup = build_mapping_lookup(speaker_mapping)
+    speaker_lookup = build_speaker_label_lookup(speaker_mapping)
     rows: List[Dict[str, Any]] = []
     for index, segment in enumerate(asr_segments, 1):
         chunk_index = int(segment.get("chunk_index") or 0)
         local_speaker = str(segment.get("local_speaker") or segment.get("speaker") or "speaker")
-        mapped = mapping_lookup.get((chunk_index, local_speaker))
-        if mapped:
-            speaker_id = mapped["id"]
-            label = mapped["label"]
+        explicit_speaker_id = str(segment.get("speaker_id") or "").strip()
+        explicit_speaker = speaker_lookup.get(explicit_speaker_id)
+        if explicit_speaker:
+            speaker_id = explicit_speaker["id"]
+            label = explicit_speaker["label"]
         else:
-            speaker_id = ytranslate.speaker_id_from_label(local_speaker)
-            label = speaker_label_from_local(local_speaker)
+            mapped = mapping_lookup.get((chunk_index, local_speaker))
+            if mapped:
+                speaker_id = mapped["id"]
+                label = mapped["label"]
+            else:
+                speaker_id = ytranslate.speaker_id_from_label(local_speaker)
+                label = speaker_label_from_local(local_speaker)
         start = float(segment.get("start") or 0.0)
         end = float(segment.get("end") or start)
         rows.append(
@@ -110,6 +131,9 @@ def build_audit_rows(
                 "end": round(end, 3),
                 "start_timecode": ytranslate.format_timecode(start),
                 "end_timecode": ytranslate.format_timecode(end),
+                "speaker_id_source": str(segment.get("speaker_id_source") or "local_mapping"),
+                "voice_similarity": segment.get("voice_similarity"),
+                "voice_similarity_margin": segment.get("voice_similarity_margin"),
                 "text": ytranslate.clean_segment_text(segment.get("text", "")),
             }
         )
@@ -170,6 +194,11 @@ def render_audit_html(
     table_rows = []
     for row in rows:
         local_key = f"{row['chunk_index']}:{row['local_speaker']}"
+        voice_score = row.get("voice_similarity")
+        voice_margin = row.get("voice_similarity_margin")
+        voice_cell = ""
+        if voice_score is not None:
+            voice_cell = f"{float(voice_score):.3f} / {float(voice_margin or 0):.3f}"
         table_rows.append(
             "<tr "
             f"data-chunk=\"{row['chunk_index']}\" "
@@ -181,6 +210,8 @@ def render_audit_html(
             f"<td>{row['chunk_index']}</td>"
             f"<td>{html.escape(row['local_speaker'])}</td>"
             f"<td>{html.escape(row['mapped_speaker_label'])}</td>"
+            f"<td>{html.escape(str(row.get('speaker_id_source') or ''))}</td>"
+            f"<td>{html.escape(voice_cell)}</td>"
             f"<td class=\"text\">{html.escape(row['text'])}</td>"
             "</tr>"
         )
@@ -362,6 +393,8 @@ def render_audit_html(
           <th>Chunk</th>
           <th>Raw ASR local speaker</th>
           <th>Mapped final speaker</th>
+          <th>Assignment source</th>
+          <th>Voice score / margin</th>
           <th>Source text</th>
         </tr>
       </thead>
@@ -462,6 +495,7 @@ def build_report(
     audio_path: Path,
     output_dir: Path,
     run_mapping: bool,
+    run_voice_reconciliation: bool,
 ) -> Path:
     ytranslate.load_project_env()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -469,6 +503,16 @@ def build_report(
     metadata = load_or_create_metadata(video_id, output_dir)
     segments = asr_data.get("segments", [])
     mapping = load_or_create_mapping(url, video_id, output_dir, metadata, segments, run_mapping)
+    voice_debug: Optional[Dict[str, Any]] = None
+    if mapping and run_voice_reconciliation:
+        segments, voice_debug = ytranslate.reconcile_diarized_segments_with_voice(
+            url,
+            video_id,
+            segments,
+            mapping,
+            lambda message: print(message),
+        )
+        write_json(output_dir / "voice-speaker-reconciliation.json", voice_debug)
     rows = build_audit_rows(segments, mapping)
     write_json(output_dir / "audit-rows.json", rows)
     html_text = render_audit_html(
@@ -498,6 +542,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-path", type=Path)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--no-run-mapping", action="store_true")
+    parser.add_argument("--no-voice-reconciliation", action="store_true")
     return parser.parse_args()
 
 
@@ -514,6 +559,7 @@ def main() -> int:
         audio_path=audio_path,
         output_dir=output_dir,
         run_mapping=not args.no_run_mapping,
+        run_voice_reconciliation=not args.no_voice_reconciliation,
     )
     print(f"Wrote {report_path}")
     return 0

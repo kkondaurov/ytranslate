@@ -297,6 +297,95 @@ class DiarizedAsrTests(unittest.TestCase):
 
         self.assertEqual(effective["local_speakers"][1]["speaker_id"], "speaker_friedberg")
 
+    def test_voice_reconciliation_can_override_mixed_local_speaker_segments(self):
+        segments = [
+            {"chunk_index": 1, "local_speaker": "A", "speaker": "A", "start": 0, "end": 8, "text": "Alice anchor."},
+            {"chunk_index": 1, "local_speaker": "B", "speaker": "B", "start": 10, "end": 18, "text": "Bob anchor."},
+            {"chunk_index": 2, "local_speaker": "A", "speaker": "A", "start": 20, "end": 27, "text": "This is actually Bob."},
+            {"chunk_index": 2, "local_speaker": "A", "speaker": "A", "start": 27.1, "end": 28, "text": "short continuation"},
+            {"chunk_index": 2, "local_speaker": "B", "speaker": "B", "start": 30, "end": 37, "text": "This is actually Alice."},
+        ]
+        speaker_mapping = {
+            "speakers": [
+                {"id": "speaker_alice", "label_short": "Alice", "label_full": "Alice"},
+                {"id": "speaker_bob", "label_short": "Bob", "label_full": "Bob"},
+            ],
+            "local_speakers": [
+                {"chunk_index": 1, "local_speaker": "A", "speaker_id": "speaker_alice"},
+                {"chunk_index": 1, "local_speaker": "B", "speaker_id": "speaker_bob"},
+                {"chunk_index": 2, "local_speaker": "A", "speaker_id": "speaker_alice"},
+                {"chunk_index": 2, "local_speaker": "B", "speaker_id": "speaker_bob"},
+            ],
+        }
+        embeddings = {
+            0: [1.0, 0.0],
+            1: [0.0, 1.0],
+            2: [0.02, 1.0],
+            4: [1.0, 0.01],
+        }
+
+        resolved, debug = ytranslate.reconcile_segment_speakers_with_voice_embeddings(
+            segments,
+            speaker_mapping,
+            embeddings,
+            min_similarity=0.8,
+            min_margin=0.2,
+            neighbor_gap_seconds=1.0,
+        )
+
+        self.assertEqual(resolved[2]["speaker_id"], "speaker_bob")
+        self.assertEqual(resolved[2]["speaker_id_source"], "voice")
+        self.assertEqual(resolved[3]["speaker_id"], "speaker_bob")
+        self.assertEqual(resolved[3]["speaker_id_source"], "voice_neighbor")
+        self.assertEqual(resolved[4]["speaker_id"], "speaker_alice")
+        self.assertEqual(debug["voice_changed_count"], 2)
+        self.assertEqual(debug["neighbor_assigned_count"], 1)
+
+        attributed = ytranslate.attributed_turns_from_diarized_segments(resolved, speaker_mapping)
+        self.assertEqual(
+            attributed["turns"],
+            [
+                {"speaker_id": "speaker_alice", "text_source": "Alice anchor."},
+                {"speaker_id": "speaker_bob", "text_source": "Bob anchor. This is actually Bob. short continuation"},
+                {"speaker_id": "speaker_alice", "text_source": "This is actually Alice."},
+            ],
+        )
+
+    def test_voice_reconciliation_keeps_baseline_on_low_margin_match(self):
+        segments = [
+            {"chunk_index": 1, "local_speaker": "A", "speaker": "A", "start": 0, "end": 8, "text": "Alice anchor."},
+            {"chunk_index": 1, "local_speaker": "B", "speaker": "B", "start": 10, "end": 18, "text": "Bob anchor."},
+            {"chunk_index": 2, "local_speaker": "A", "speaker": "A", "start": 20, "end": 27, "text": "Ambiguous voice."},
+        ]
+        speaker_mapping = {
+            "speakers": [
+                {"id": "speaker_alice", "label_short": "Alice", "label_full": "Alice"},
+                {"id": "speaker_bob", "label_short": "Bob", "label_full": "Bob"},
+            ],
+            "local_speakers": [
+                {"chunk_index": 1, "local_speaker": "A", "speaker_id": "speaker_alice"},
+                {"chunk_index": 1, "local_speaker": "B", "speaker_id": "speaker_bob"},
+                {"chunk_index": 2, "local_speaker": "A", "speaker_id": "speaker_alice"},
+            ],
+        }
+        embeddings = {
+            0: [1.0, 0.0],
+            1: [0.0, 1.0],
+            2: [0.62, 0.78],
+        }
+
+        resolved, debug = ytranslate.reconcile_segment_speakers_with_voice_embeddings(
+            segments,
+            speaker_mapping,
+            embeddings,
+            min_similarity=0.5,
+            min_margin=0.4,
+        )
+
+        self.assertEqual(resolved[2]["speaker_id"], "speaker_alice")
+        self.assertEqual(resolved[2]["speaker_id_source"], "local_mapping")
+        self.assertEqual(debug["voice_changed_count"], 0)
+
 
 class RunTranslationJobSourceChoiceTests(unittest.TestCase):
     def run_with_common_mocks(self, transcript_info, speaker_overrides=None):
@@ -346,6 +435,11 @@ class RunTranslationJobSourceChoiceTests(unittest.TestCase):
             patch.object(ytranslate, "transcribe_youtube_audio_with_openai", return_value=asr_result) as asr_mock,
             patch.object(ytranslate, "assign_global_speakers_for_diarized_segments", return_value=speaker_mapping) as mapping_mock,
             patch.object(ytranslate, "load_speaker_mapping_overrides", return_value=speaker_overrides),
+            patch.object(
+                ytranslate,
+                "reconcile_diarized_segments_with_voice",
+                side_effect=lambda _url, _video_id, segments, _speaker_mapping, _log: (segments, {"status": "test"}),
+            ),
             patch.object(ytranslate, "translate_attributed_turns", side_effect=fake_translate),
             patch.object(ytranslate, "render_docx") as render_mock,
             patch.object(ytranslate, "convert_docx_to_pdf", return_value="/tmp/video.pdf"),

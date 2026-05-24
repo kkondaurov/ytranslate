@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import os
 import random
 import re
@@ -48,6 +49,16 @@ OUTPUT_DIR = os.path.expanduser("~/Downloads")
 CACHE_DIR = os.path.expanduser("~/Library/Caches/ytranslate")
 SPEAKER_OVERRIDES_FILENAME = "speaker-overrides.json"
 TURN_TEXT_PASS_MAX_CHARS = 12_000
+VOICE_RECONCILIATION_MIN_SEGMENT_SECONDS = 2.4
+VOICE_RECONCILIATION_MAX_SEGMENT_SECONDS = 16.0
+VOICE_RECONCILIATION_MIN_SIMILARITY = 0.86
+VOICE_RECONCILIATION_MIN_MARGIN = 0.035
+VOICE_RECONCILIATION_NEIGHBOR_GAP_SECONDS = 1.0
+VOICE_RECONCILIATION_MIN_ANCHOR_SEGMENTS = 2
+VOICE_RECONCILIATION_MIN_ANCHOR_SECONDS = 5.0
+VOICE_RECONCILIATION_MAX_ANCHOR_SEGMENTS = 28
+VOICE_RECONCILIATION_LOCAL_MAJORITY_SHARE = 0.78
+VOICE_RECONCILIATION_LOCAL_MAJORITY_MIN_SEGMENTS = 2
 
 
 def parse_args() -> argparse.Namespace:
@@ -933,6 +944,424 @@ def apply_chunk_boundary_speaker_continuity(
     return apply_speaker_mapping_overrides(speaker_mapping, {"local_speakers": overrides})
 
 
+def get_speaker_mapping_by_local(speaker_mapping: Optional[Dict[str, Any]]) -> Dict[Any, str]:
+    if not speaker_mapping:
+        return {}
+    return {
+        (int(item.get("chunk_index") or 0), str(item.get("local_speaker") or "speaker")): str(
+            item.get("speaker_id") or ""
+        )
+        for item in speaker_mapping.get("local_speakers", [])
+        if item.get("speaker_id")
+    }
+
+
+def get_segment_local_key(segment: Dict[str, Any]) -> Any:
+    chunk_index = int(segment.get("chunk_index") or 0)
+    local_speaker = str(segment.get("local_speaker") or segment.get("speaker") or "speaker")
+    return chunk_index, local_speaker
+
+
+def get_baseline_segment_speaker_id(
+    segment: Dict[str, Any],
+    mapping_by_local: Dict[Any, str],
+) -> str:
+    chunk_index, local_speaker = get_segment_local_key(segment)
+    speaker_id = mapping_by_local.get((chunk_index, local_speaker))
+    if speaker_id:
+        return speaker_id
+    raw_speaker = str(segment.get("speaker") or local_speaker or "speaker")
+    return speaker_id_from_label(raw_speaker)
+
+
+def normalize_embedding(values: List[float]) -> Optional[List[float]]:
+    vector = [float(value) for value in values]
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm <= 0:
+        return None
+    return [value / norm for value in vector]
+
+
+def cosine_similarity(left: List[float], right: List[float]) -> float:
+    return sum(a * b for a, b in zip(left, right))
+
+
+def average_embeddings(embeddings: List[List[float]]) -> Optional[List[float]]:
+    if not embeddings:
+        return None
+    width = len(embeddings[0])
+    averaged = [
+        sum(embedding[index] for embedding in embeddings) / len(embeddings)
+        for index in range(width)
+    ]
+    return normalize_embedding(averaged)
+
+
+def robust_embedding_centroid(embeddings: List[List[float]]) -> Optional[List[float]]:
+    if len(embeddings) <= 2:
+        return average_embeddings(embeddings)
+    initial = average_embeddings(embeddings)
+    if not initial:
+        return None
+    ranked = sorted(
+        embeddings,
+        key=lambda embedding: cosine_similarity(embedding, initial),
+        reverse=True,
+    )
+    keep_count = max(VOICE_RECONCILIATION_MIN_ANCHOR_SEGMENTS, math.ceil(len(ranked) * 0.7))
+    return average_embeddings(ranked[:keep_count])
+
+
+def choose_voice_anchor_groups(
+    segments: List[Dict[str, Any]],
+    speaker_mapping: Dict[str, Any],
+    embeddings: Dict[int, List[float]],
+) -> Dict[str, Dict[str, Any]]:
+    mapping_by_local = get_speaker_mapping_by_local(speaker_mapping)
+    groups: Dict[Any, Dict[str, Any]] = {}
+    for index, segment in enumerate(segments):
+        embedding = embeddings.get(index)
+        if embedding is None:
+            continue
+        speaker_id = get_baseline_segment_speaker_id(segment, mapping_by_local)
+        chunk_index, local_speaker = get_segment_local_key(segment)
+        key = (speaker_id, chunk_index, local_speaker)
+        start = float(segment.get("start") or 0)
+        end = float(segment.get("end") or start)
+        group = groups.setdefault(
+            key,
+            {
+                "speaker_id": speaker_id,
+                "chunk_index": chunk_index,
+                "local_speaker": local_speaker,
+                "start": start,
+                "end": end,
+                "total_duration": 0.0,
+                "embeddings": [],
+                "segment_indexes": [],
+            },
+        )
+        group["start"] = min(float(group["start"]), start)
+        group["end"] = max(float(group["end"]), end)
+        group["total_duration"] += max(0.0, end - start)
+        group["embeddings"].append(embedding)
+        group["segment_indexes"].append(index)
+
+    anchors: Dict[str, Dict[str, Any]] = {}
+    speaker_ids = [
+        str(speaker.get("id"))
+        for speaker in speaker_mapping.get("speakers", [])
+        if speaker.get("id")
+    ]
+    for speaker_id in speaker_ids:
+        candidates = [
+            group
+            for group in groups.values()
+            if group["speaker_id"] == speaker_id
+        ]
+        candidates.sort(
+            key=lambda group: (
+                int(group["chunk_index"]),
+                float(group["start"]),
+                -float(group["total_duration"]),
+            )
+        )
+        qualified = [
+            group
+            for group in candidates
+            if len(group["embeddings"]) >= VOICE_RECONCILIATION_MIN_ANCHOR_SEGMENTS
+            and float(group["total_duration"]) >= VOICE_RECONCILIATION_MIN_ANCHOR_SECONDS
+        ]
+        chosen = qualified[0] if qualified else (candidates[0] if candidates else None)
+        if not chosen:
+            continue
+        embeddings_for_centroid = chosen["embeddings"][:VOICE_RECONCILIATION_MAX_ANCHOR_SEGMENTS]
+        centroid = robust_embedding_centroid(embeddings_for_centroid)
+        if not centroid:
+            continue
+        anchors[speaker_id] = {
+            "speaker_id": speaker_id,
+            "chunk_index": chosen["chunk_index"],
+            "local_speaker": chosen["local_speaker"],
+            "start": round(float(chosen["start"]), 3),
+            "end": round(float(chosen["end"]), 3),
+            "segment_count": len(chosen["embeddings"]),
+            "total_duration": round(float(chosen["total_duration"]), 3),
+            "centroid": centroid,
+        }
+    return anchors
+
+
+def reconcile_segment_speakers_with_voice_embeddings(
+    segments: List[Dict[str, Any]],
+    speaker_mapping: Dict[str, Any],
+    segment_embeddings: Dict[int, List[float]],
+    min_similarity: float = VOICE_RECONCILIATION_MIN_SIMILARITY,
+    min_margin: float = VOICE_RECONCILIATION_MIN_MARGIN,
+    neighbor_gap_seconds: float = VOICE_RECONCILIATION_NEIGHBOR_GAP_SECONDS,
+) -> Any:
+    mapping_by_local = get_speaker_mapping_by_local(speaker_mapping)
+    normalized_embeddings: Dict[int, List[float]] = {}
+    for index, embedding in segment_embeddings.items():
+        normalized = normalize_embedding(embedding)
+        if normalized is not None:
+            normalized_embeddings[int(index)] = normalized
+
+    anchors = choose_voice_anchor_groups(segments, speaker_mapping, normalized_embeddings)
+    speakers_by_id = {
+        str(speaker.get("id")): speaker
+        for speaker in speaker_mapping.get("speakers", [])
+        if speaker.get("id")
+    }
+    debug: Dict[str, Any] = {
+        "status": "ok" if len(anchors) >= 2 else "skipped",
+        "speaker_anchor_groups": [
+            {
+                key: value
+                for key, value in anchor.items()
+                if key != "centroid"
+            }
+            for anchor in anchors.values()
+        ],
+        "segment_count": len(segments),
+        "embedded_segment_count": len(normalized_embeddings),
+        "voice_assigned_count": 0,
+        "voice_changed_count": 0,
+        "local_majority_assigned_count": 0,
+        "neighbor_assigned_count": 0,
+        "changed_examples": [],
+    }
+    resolved = [dict(segment) for segment in segments]
+    if len(anchors) < 2:
+        for segment in resolved:
+            speaker_id = get_baseline_segment_speaker_id(segment, mapping_by_local)
+            segment.setdefault("speaker_id", speaker_id)
+            segment.setdefault("speaker_id_source", "local_mapping")
+        return resolved, debug
+
+    anchor_items = list(anchors.items())
+    for index, segment in enumerate(resolved):
+        baseline_speaker_id = get_baseline_segment_speaker_id(segment, mapping_by_local)
+        segment["speaker_id"] = baseline_speaker_id
+        segment["speaker_id_source"] = "local_mapping"
+        embedding = normalized_embeddings.get(index)
+        if embedding is None:
+            continue
+
+        scored = sorted(
+            (
+                (speaker_id, cosine_similarity(embedding, anchor["centroid"]))
+                for speaker_id, anchor in anchor_items
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        best_speaker_id, best_score = scored[0]
+        second_score = scored[1][1] if len(scored) > 1 else -1.0
+        margin = best_score - second_score
+        segment["voice_speaker_id"] = best_speaker_id
+        segment["voice_similarity"] = round(best_score, 4)
+        segment["voice_similarity_margin"] = round(margin, 4)
+        if best_score < min_similarity or margin < min_margin:
+            continue
+
+        segment["speaker_id"] = best_speaker_id
+        segment["speaker_id_source"] = "voice"
+        debug["voice_assigned_count"] += 1
+        if best_speaker_id != baseline_speaker_id:
+            debug["voice_changed_count"] += 1
+            if len(debug["changed_examples"]) < 20:
+                debug["changed_examples"].append(
+                    {
+                        "index": index + 1,
+                        "start": round(float(segment.get("start") or 0), 3),
+                        "chunk_index": int(segment.get("chunk_index") or 0),
+                        "local_speaker": str(segment.get("local_speaker") or segment.get("speaker") or "speaker"),
+                        "baseline_speaker_id": baseline_speaker_id,
+                        "voice_speaker_id": best_speaker_id,
+                        "voice_similarity": round(best_score, 4),
+                        "voice_similarity_margin": round(margin, 4),
+                        "text": clean_segment_text(segment.get("text", ""))[:180],
+                    }
+                )
+
+    local_voice_counts: Dict[Any, Dict[str, int]] = {}
+    for segment in resolved:
+        if segment.get("speaker_id_source") != "voice":
+            continue
+        local_key = get_segment_local_key(segment)
+        speaker_id = str(segment.get("speaker_id") or "")
+        if not speaker_id:
+            continue
+        local_voice_counts.setdefault(local_key, {})
+        local_voice_counts[local_key][speaker_id] = local_voice_counts[local_key].get(speaker_id, 0) + 1
+
+    for segment in resolved:
+        if segment.get("speaker_id_source") != "local_mapping":
+            continue
+        counts = local_voice_counts.get(get_segment_local_key(segment), {})
+        if not counts:
+            continue
+        top_speaker_id, top_count = max(counts.items(), key=lambda item: item[1])
+        total_count = sum(counts.values())
+        if (
+            top_count < VOICE_RECONCILIATION_LOCAL_MAJORITY_MIN_SEGMENTS
+            or top_count / total_count < VOICE_RECONCILIATION_LOCAL_MAJORITY_SHARE
+        ):
+            continue
+        if top_speaker_id == segment.get("speaker_id"):
+            continue
+        segment["speaker_id"] = top_speaker_id
+        segment["speaker_id_source"] = "voice_local_majority"
+        debug["local_majority_assigned_count"] += 1
+
+    for index, segment in enumerate(resolved):
+        if segment.get("speaker_id_source") != "local_mapping":
+            continue
+        current_key = get_segment_local_key(segment)
+        current_start = float(segment.get("start") or 0)
+        previous = resolved[index - 1] if index > 0 else None
+        if previous and previous.get("speaker_id_source") in {"voice", "voice_neighbor"}:
+            previous_key = get_segment_local_key(previous)
+            previous_end = float(previous.get("end") or previous.get("start") or 0)
+            if previous_key == current_key and current_start - previous_end <= neighbor_gap_seconds:
+                segment["speaker_id"] = str(previous["speaker_id"])
+                segment["speaker_id_source"] = "voice_neighbor"
+                debug["neighbor_assigned_count"] += 1
+                continue
+
+        next_segment = resolved[index + 1] if index + 1 < len(resolved) else None
+        if next_segment and next_segment.get("speaker_id_source") in {"voice", "voice_neighbor"}:
+            next_key = get_segment_local_key(next_segment)
+            current_end = float(segment.get("end") or segment.get("start") or 0)
+            next_start = float(next_segment.get("start") or 0)
+            if next_key == current_key and next_start - current_end <= neighbor_gap_seconds:
+                segment["speaker_id"] = str(next_segment["speaker_id"])
+                segment["speaker_id_source"] = "voice_neighbor"
+                debug["neighbor_assigned_count"] += 1
+
+    debug["speaker_count"] = len(speakers_by_id)
+    return resolved, debug
+
+
+def get_voice_reconciliation_enabled() -> bool:
+    raw = os.getenv("YTRANSLATE_VOICE_SPEAKER_RECONCILIATION", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def transcode_audio_for_voice_reconciliation(
+    source_audio_path: str,
+    video_id: str,
+    log: Callable[[str], None],
+) -> str:
+    voice_dir = os.path.join(get_video_cache_dir(video_id), "voice-speaker-reconciliation")
+    os.makedirs(voice_dir, exist_ok=True)
+    output_path = os.path.join(voice_dir, "source-16k.wav")
+    if os.path.exists(output_path):
+        return output_path
+
+    command = [
+        get_ffmpeg_executable(),
+        "-hide_banner",
+        "-y",
+        "-i",
+        source_audio_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        output_path,
+    ]
+    log("Preparing audio for voice speaker reconciliation...")
+    subprocess.run(command, check=True)
+    return output_path
+
+
+def build_voice_segment_embeddings(
+    wav_path: str,
+    segments: List[Dict[str, Any]],
+    log: Callable[[str], None],
+    min_segment_seconds: float = VOICE_RECONCILIATION_MIN_SEGMENT_SECONDS,
+    max_segment_seconds: float = VOICE_RECONCILIATION_MAX_SEGMENT_SECONDS,
+) -> Dict[int, List[float]]:
+    try:
+        import soundfile as sf
+        from resemblyzer import VoiceEncoder
+    except ImportError as exc:
+        raise RuntimeError(
+            "Voice speaker reconciliation requires resemblyzer and soundfile."
+        ) from exc
+
+    audio, sample_rate = sf.read(wav_path, dtype="float32")
+    if getattr(audio, "ndim", 1) > 1:
+        audio = audio.mean(axis=1)
+    if int(sample_rate) != 16000:
+        raise RuntimeError(f"Expected 16000 Hz voice reconciliation audio, got {sample_rate}")
+
+    encoder = VoiceEncoder()
+    embeddings: Dict[int, List[float]] = {}
+    audio_length = len(audio)
+    for index, segment in enumerate(segments):
+        start = float(segment.get("start") or 0)
+        end = float(segment.get("end") or start)
+        duration = end - start
+        if duration < min_segment_seconds:
+            continue
+        if duration > max_segment_seconds:
+            midpoint = (start + end) / 2
+            start = midpoint - max_segment_seconds / 2
+            end = midpoint + max_segment_seconds / 2
+        start_sample = max(0, int(start * sample_rate))
+        end_sample = min(audio_length, int(end * sample_rate))
+        if end_sample - start_sample < int(min_segment_seconds * sample_rate):
+            continue
+        embedding = encoder.embed_utterance(audio[start_sample:end_sample])
+        embeddings[index] = [float(value) for value in embedding]
+
+    log(f"Voice speaker reconciliation embedded {len(embeddings)} transcript segments.")
+    return embeddings
+
+
+def reconcile_diarized_segments_with_voice(
+    url: str,
+    video_id: str,
+    segments: List[Dict[str, Any]],
+    speaker_mapping: Dict[str, Any],
+    log: Callable[[str], None],
+) -> Any:
+    if not get_voice_reconciliation_enabled():
+        return [dict(segment) for segment in segments], {"status": "disabled"}
+    if len(speaker_mapping.get("speakers", [])) < 2 or not segments:
+        return [dict(segment) for segment in segments], {"status": "skipped"}
+
+    try:
+        source_audio_path = download_youtube_audio(url, video_id, log)
+        wav_path = transcode_audio_for_voice_reconciliation(source_audio_path, video_id, log)
+        embeddings = build_voice_segment_embeddings(wav_path, segments, log)
+        resolved, debug = reconcile_segment_speakers_with_voice_embeddings(
+            segments,
+            speaker_mapping,
+            embeddings,
+        )
+        if debug.get("status") == "ok":
+            log(
+                "Voice speaker reconciliation changed "
+                f"{debug.get('voice_changed_count', 0)} segments "
+                f"and filled {debug.get('local_majority_assigned_count', 0)} local-majority "
+                f"plus {debug.get('neighbor_assigned_count', 0)} short-neighbor segments."
+            )
+        return resolved, debug
+    except Exception as exc:
+        log(f"Voice speaker reconciliation skipped ({exc}).")
+        resolved = [dict(segment) for segment in segments]
+        mapping_by_local = get_speaker_mapping_by_local(speaker_mapping)
+        for segment in resolved:
+            segment.setdefault("speaker_id", get_baseline_segment_speaker_id(segment, mapping_by_local))
+            segment.setdefault("speaker_id_source", "local_mapping")
+        return resolved, {"status": "skipped", "error": str(exc)}
+
+
 def attributed_turns_from_diarized_segments(
     segments: List[Dict[str, Any]],
     speaker_mapping: Optional[Dict[str, Any]] = None,
@@ -943,17 +1372,22 @@ def attributed_turns_from_diarized_segments(
     if speaker_mapping:
         for speaker in speaker_mapping.get("speakers", []):
             speakers_by_id[speaker["id"]] = speaker
-        mapping_by_local = {
-            (int(item.get("chunk_index") or 0), str(item.get("local_speaker") or "speaker")): item.get("speaker_id")
-            for item in speaker_mapping.get("local_speakers", [])
-        }
+        mapping_by_local = get_speaker_mapping_by_local(speaker_mapping)
 
     for segment in segments:
         raw_speaker = str(segment.get("speaker") or "speaker")
         speaker_label = raw_speaker if raw_speaker.lower().startswith("speaker") else f"Speaker {raw_speaker}"
         local_speaker = str(segment.get("local_speaker") or raw_speaker)
         chunk_index = int(segment.get("chunk_index") or 0)
-        speaker_id = mapping_by_local.get((chunk_index, local_speaker))
+        speaker_id = str(segment.get("speaker_id") or "").strip()
+        if speaker_id and speaker_id not in speakers_by_id:
+            speakers_by_id[speaker_id] = {
+                "id": speaker_id,
+                "label_short": speaker_id,
+                "label_full": speaker_id,
+            }
+        if not speaker_id:
+            speaker_id = mapping_by_local.get((chunk_index, local_speaker))
         if not speaker_id:
             speaker_id = speaker_id_from_label(raw_speaker)
             speakers_by_id.setdefault(
@@ -2566,6 +3000,8 @@ def run_translation_job(
     transcript_source = ""
     asr_result: Optional[Dict[str, Any]] = None
     speaker_mapping: Optional[Dict[str, Any]] = None
+    voice_reconciliation_debug: Optional[Dict[str, Any]] = None
+    resolved_asr_segments: Optional[List[Dict[str, Any]]] = None
     if transcript_info is not None and is_high_quality_youtube_transcript(transcript_info):
         log("Using manual speaker-labeled YouTube transcript.")
         transcript_source = "youtube_speaker_labeled"
@@ -2599,8 +3035,16 @@ def run_translation_job(
         if speaker_overrides:
             log("Applying speaker mapping overrides...")
             speaker_mapping = apply_speaker_mapping_overrides(speaker_mapping, speaker_overrides)
-        attributed = attributed_turns_from_diarized_segments(
+        log("Refining ASR speaker identities with voice matching...")
+        resolved_asr_segments, voice_reconciliation_debug = reconcile_diarized_segments_with_voice(
+            canonical_url,
+            video_id,
             asr_result.get("segments", []),
+            speaker_mapping,
+            log,
+        )
+        attributed = attributed_turns_from_diarized_segments(
+            resolved_asr_segments,
             speaker_mapping,
         )
 
@@ -2611,8 +3055,18 @@ def run_translation_job(
         write_json_file(os.path.join(debug_dir, "source-attributed-turns.json"), attributed)
         if asr_result is not None:
             write_json_file(os.path.join(debug_dir, "openai-asr.json"), asr_result)
+        if resolved_asr_segments is not None:
+            write_json_file(
+                os.path.join(debug_dir, "openai-asr-resolved-segments.json"),
+                resolved_asr_segments,
+            )
         if speaker_mapping is not None:
             write_json_file(os.path.join(debug_dir, "speaker-mapping.json"), speaker_mapping)
+        if voice_reconciliation_debug is not None:
+            write_json_file(
+                os.path.join(debug_dir, "voice-speaker-reconciliation.json"),
+                voice_reconciliation_debug,
+            )
         if speaker_pass_debug:
             for idx, item in enumerate(speaker_pass_debug, 1):
                 write_json_file(
