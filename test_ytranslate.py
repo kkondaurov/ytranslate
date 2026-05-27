@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import ytranslate
@@ -70,10 +72,87 @@ class DiarizedAsrTests(unittest.TestCase):
     def test_default_asr_chunk_length_stays_under_model_limit(self):
         self.assertLessEqual(ytranslate.ASR_CHUNK_SECONDS, ytranslate.ASR_MAX_CHUNK_SECONDS)
 
+    def test_default_asr_chunk_length_is_ten_minutes_for_long_upload_reliability(self):
+        self.assertEqual(ytranslate.ASR_CHUNK_SECONDS, 600)
+
     def test_asr_chunk_length_rejects_values_above_model_limit(self):
         with patch.dict("os.environ", {"OPENAI_ASR_CHUNK_SECONDS": "2700"}):
             with self.assertRaisesRegex(RuntimeError, "exceeds the OpenAI ASR model limit"):
                 ytranslate.get_asr_chunk_seconds()
+
+    def test_default_asr_request_timeout_is_shorter_than_text_generation_timeout(self):
+        self.assertEqual(ytranslate.get_asr_timeout_seconds(), 600)
+        self.assertLess(ytranslate.get_asr_timeout_seconds(), ytranslate.OPENAI_TIMEOUT_SECONDS)
+
+    def test_openai_asr_request_logs_attempts_and_uses_retry_setting(self):
+        class FakeResponse:
+            status_code = 200
+            text = "{}"
+
+            def json(self):
+                return {"segments": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            chunk = Path(tmp) / "chunk-000.mp3"
+            chunk.write_bytes(b"fake audio")
+            messages = []
+
+            with (
+                patch.dict("os.environ", {"OPENAI_ASR_MAX_RETRIES": "2"}),
+                patch.dict("os.environ", {"OPENAI_ASR_TRANSPORT": "requests"}),
+                patch.object(
+                    ytranslate.requests,
+                    "post",
+                    side_effect=[ytranslate.requests.Timeout("slow upload"), FakeResponse()],
+                ) as post,
+                patch.object(ytranslate.time, "sleep"),
+            ):
+                result = ytranslate.transcribe_audio_chunk(
+                    str(chunk),
+                    "test-key",
+                    "gpt-4o-transcribe-diarize",
+                    123,
+                    log=messages.append,
+                )
+
+        self.assertEqual(result, {"segments": []})
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args.kwargs["timeout"], 123)
+        self.assertIn(
+            "OpenAI ASR request attempt 1/2 for chunk-000.mp3 via requests (timeout=123s)",
+            messages,
+        )
+        self.assertTrue(
+            any("retryable error on attempt 1/2 for chunk-000.mp3" in message for message in messages)
+        )
+
+    def test_openai_asr_curl_transport_keeps_api_key_out_of_process_args(self):
+        completed = Mock(returncode=0, stdout='{"segments": []}', stderr="")
+        with tempfile.TemporaryDirectory() as tmp:
+            chunk = Path(tmp) / "chunk-000.mp3"
+            chunk.write_bytes(b"fake audio")
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"OPENAI_ASR_TRANSPORT": "curl", "OPENAI_ASR_MAX_RETRIES": "1"},
+                ),
+                patch.object(ytranslate.shutil, "which", return_value="/usr/bin/curl"),
+                patch.object(ytranslate.subprocess, "run", return_value=completed) as run,
+            ):
+                result = ytranslate.transcribe_audio_chunk(
+                    str(chunk),
+                    "test-key",
+                    "gpt-4o-transcribe-diarize",
+                    123,
+                )
+
+        self.assertEqual(result, {"segments": []})
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/curl", "--config", "-"])
+        self.assertNotIn("test-key", " ".join(run.call_args.args[0]))
+        self.assertIn('header = "Authorization: Bearer test-key"', run.call_args.kwargs["input"])
+        self.assertIn("http1.1", run.call_args.kwargs["input"])
+        self.assertIn("retry-all-errors", run.call_args.kwargs["input"])
 
     def test_extract_diarized_segments_normalizes_openai_response(self):
         response = {
@@ -135,6 +214,114 @@ class DiarizedAsrTests(unittest.TestCase):
                 },
             ],
         )
+
+    def test_openai_asr_reports_failed_chunks_after_caching_successes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp)
+            chunks = [
+                cache_dir / "chunks-600s" / "chunk-000.mp3",
+                cache_dir / "chunks-600s" / "chunk-001.mp3",
+            ]
+            chunks[0].parent.mkdir()
+            for chunk in chunks:
+                chunk.write_bytes(b"fake audio")
+
+            calls = []
+            messages = []
+
+            def fake_transcribe(chunk_path, _openai_key, _asr_model, _timeout_seconds, log=None):
+                calls.append((Path(chunk_path).name, _timeout_seconds))
+                if Path(chunk_path).name == "chunk-000.mp3":
+                    raise RuntimeError("upload failed")
+                return {"segments": []}
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"OPENAI_ASR_JOBS": "1", "OPENAI_ASR_MAX_PASSES": "1"},
+                ),
+                patch.object(ytranslate, "get_video_cache_dir", return_value=str(cache_dir)),
+                patch.object(ytranslate, "download_youtube_audio", return_value=str(cache_dir / "source.m4a")),
+                patch.object(ytranslate, "transcode_and_chunk_audio", return_value=[str(chunk) for chunk in chunks]),
+                patch.object(ytranslate, "build_chunk_offsets", return_value=[0.0, 600.0]),
+                patch.object(ytranslate, "transcribe_audio_chunk", side_effect=fake_transcribe),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "OpenAI ASR completed 1/2 chunks; failed: chunk-000.mp3",
+                ):
+                    ytranslate.transcribe_youtube_audio_with_openai(
+                        "https://youtu.be/example",
+                        "example",
+                        "test-key",
+                        log=messages.append,
+                    )
+
+            self.assertEqual(calls, [("chunk-000.mp3", 600), ("chunk-001.mp3", 600)])
+            self.assertTrue(
+                any("OpenAI ASR failed chunk-000.mp3 (1/2)" in message for message in messages)
+            )
+            self.assertTrue(
+                (cache_dir / "openai-asr-chunks-gpt-4o-transcribe-diarize-600s" / "chunk-001.json").exists()
+            )
+
+    def test_openai_asr_retries_failed_chunks_in_later_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp)
+            chunks = [
+                cache_dir / "chunks-600s" / "chunk-000.mp3",
+                cache_dir / "chunks-600s" / "chunk-001.mp3",
+            ]
+            chunks[0].parent.mkdir()
+            for chunk in chunks:
+                chunk.write_bytes(b"fake audio")
+
+            calls = []
+            messages = []
+            failed_once = False
+
+            def fake_transcribe(chunk_path, _openai_key, _asr_model, _timeout_seconds, log=None):
+                nonlocal failed_once
+                chunk_name = Path(chunk_path).name
+                calls.append(chunk_name)
+                if chunk_name == "chunk-000.mp3" and not failed_once:
+                    failed_once = True
+                    raise RuntimeError("temporary ssl failure")
+                return {"segments": []}
+
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "OPENAI_ASR_JOBS": "1",
+                        "OPENAI_ASR_MAX_PASSES": "2",
+                        "OPENAI_ASR_RETRY_PASS_DELAY_SECONDS": "0",
+                    },
+                ),
+                patch.object(ytranslate, "get_video_cache_dir", return_value=str(cache_dir)),
+                patch.object(ytranslate, "download_youtube_audio", return_value=str(cache_dir / "source.m4a")),
+                patch.object(ytranslate, "transcode_and_chunk_audio", return_value=[str(chunk) for chunk in chunks]),
+                patch.object(ytranslate, "build_chunk_offsets", return_value=[0.0, 600.0]),
+                patch.object(ytranslate, "transcribe_audio_chunk", side_effect=fake_transcribe),
+            ):
+                result = ytranslate.transcribe_youtube_audio_with_openai(
+                    "https://youtu.be/example",
+                    "example",
+                    "test-key",
+                    log=messages.append,
+                )
+
+            self.assertEqual(calls, ["chunk-000.mp3", "chunk-001.mp3", "chunk-000.mp3"])
+            self.assertEqual(len(result["chunks"]), 2)
+            self.assertTrue(
+                any(
+                    "Retrying failed OpenAI ASR chunks (pass 2/2, 1 remaining)." in message
+                    for message in messages
+                )
+            )
+            self.assertTrue(
+                (cache_dir / "openai-asr-chunks-gpt-4o-transcribe-diarize-600s" / "chunk-000.json").exists()
+            )
 
     def test_diarized_segments_become_attributed_turns(self):
         segments = [

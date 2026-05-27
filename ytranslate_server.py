@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
+import html
 import json
 import logging
+import os
 import queue
+import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
+from urllib.parse import urlparse
 
 import ytranslate
 
@@ -18,12 +23,107 @@ SERVER_PORT = 8765
 CLIENT_HEADER = "X-YTranslate-Client"
 CLIENT_HEADER_VALUE = "chrome-extension"
 ACTIVE_JOB_STATUSES = {"queued", "running"}
+MAX_HISTORY = 50
+MAX_EVENTS = 200
+DEFAULT_STATE_DIR = Path.home() / "Library" / "Application Support" / "ytranslate"
+DEFAULT_HISTORY_PATH = DEFAULT_STATE_DIR / "jobs.json"
 
 logger = logging.getLogger("ytranslate.server")
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def history_path() -> Path:
+    return Path(os.getenv("YTRANSLATE_HISTORY_PATH", str(DEFAULT_HISTORY_PATH)))
+
+
+def event_record(level: str, message: str) -> Dict[str, str]:
+    return {
+        "at": utc_now(),
+        "level": level,
+        "message": message,
+    }
+
+
+def parse_asr_chunk_message(message: str) -> Optional[Dict[str, Any]]:
+    match = re.search(r"(chunk-\d{3}\.mp3).*?\((\d+)/(\d+)\)", message)
+    if not match:
+        return None
+    return {
+        "chunk": match.group(1),
+        "index": int(match.group(2)),
+        "total": int(match.group(3)),
+    }
+
+
+def phase_for_message(message: str) -> tuple[str, str] | None:
+    if message.startswith("Fetching metadata"):
+        return "metadata", "Fetching metadata"
+    if "YouTube transcript" in message or message.startswith("Checking YouTube transcript"):
+        return "transcript", "Choosing transcript source"
+    if "Downloading audio" in message:
+        return "download", "Downloading audio"
+    if "Compressing and chunking audio" in message:
+        return "chunking", "Compressing and chunking audio"
+    if "OpenAI ASR" in message or "ASR chunk" in message:
+        return "asr", "Running OpenAI ASR"
+    if "speaker" in message.lower() or "voice" in message.lower():
+        return "speakers", "Resolving speakers"
+    if message.startswith("Translating attributed turns"):
+        return "translation", "Translating transcript"
+    if message.startswith("Polishing Russian"):
+        return "cleanup", "Polishing Russian text"
+    if message.startswith("Adding targeted glossary"):
+        return "annotation", "Adding glossary annotations"
+    if message.startswith("Saved translated transcript"):
+        return "render", "Writing DOCX/PDF output"
+    if message.startswith("Finished generating"):
+        return "done", "Finished"
+    return None
+
+
+def status_steps(job: "JobRecord") -> list[Dict[str, str]]:
+    progress = job.progress
+    asr_done = progress.get("asr_chunks_done")
+    asr_total = progress.get("asr_chunks_total")
+    asr_failed = progress.get("asr_failed_chunks") or []
+    asr_text = ""
+    if asr_total:
+        asr_text = f"{asr_done or 0} / {asr_total}"
+        if asr_failed:
+            asr_text += f", {len(asr_failed)} failed"
+
+    steps = [
+        ("queued", "Queued", ""),
+        ("metadata", "Metadata", ""),
+        ("transcript", "Transcript source", ""),
+        ("download", "Audio download", ""),
+        ("chunking", "Audio chunking", ""),
+        ("asr", "ASR chunks", asr_text),
+        ("speakers", "Speaker reconciliation", ""),
+        ("translation", "Translation", ""),
+        ("cleanup", "Russian cleanup", ""),
+        ("annotation", "Glossary annotations", ""),
+        ("render", "DOCX/PDF output", ""),
+    ]
+    order = [key for key, _label, _detail in steps]
+    phase_index = order.index(job.phase) if job.phase in order else -1
+    rendered = []
+    for index, (key, label, detail) in enumerate(steps):
+        if job.status == "succeeded":
+            state = "done"
+        elif job.status == "failed" and key == job.phase:
+            state = "failed"
+        elif index < phase_index:
+            state = "done"
+        elif index == phase_index:
+            state = "current"
+        else:
+            state = "pending"
+        rendered.append({"key": key, "label": label, "state": state, "detail": detail})
+    return rendered
 
 
 @dataclass
@@ -43,6 +143,56 @@ class JobRecord:
     error: Optional[str] = None
     duplicate_of: Optional[str] = None
     output_files: list[str] = field(default_factory=list)
+    phase: str = "queued"
+    phase_detail: str = "Queued"
+    progress: Dict[str, Any] = field(default_factory=dict)
+    events: list[Dict[str, str]] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, value: Dict[str, Any]) -> "JobRecord":
+        known = {
+            field_name: value.get(field_name)
+            for field_name in cls.__dataclass_fields__
+            if field_name in value
+        }
+        if "output_files" not in known or known["output_files"] is None:
+            known["output_files"] = []
+        if "progress" not in known or known["progress"] is None:
+            known["progress"] = {}
+        if "events" not in known or known["events"] is None:
+            known["events"] = []
+        return cls(**known)
+
+    def record_event(self, level: str, message: str) -> None:
+        self.events.append(event_record(level, message))
+        self.events = self.events[-MAX_EVENTS:]
+        self.apply_message_progress(message)
+
+    def apply_message_progress(self, message: str) -> None:
+        phase = phase_for_message(message)
+        if phase:
+            self.phase, self.phase_detail = phase
+        if "failed" in message.lower():
+            self.phase_detail = message
+
+        chunk = parse_asr_chunk_message(message)
+        if not chunk:
+            return
+
+        self.phase = "asr"
+        self.phase_detail = message
+        self.progress["current_chunk"] = chunk["chunk"]
+        self.progress["asr_chunks_total"] = chunk["total"]
+        if "failed" in message.lower():
+            failed = set(self.progress.get("asr_failed_chunks") or [])
+            failed.add(chunk["chunk"])
+            self.progress["asr_failed_chunks"] = sorted(failed)
+        elif "completed" in message or "cached" in message:
+            completed = set(self.progress.get("asr_completed_chunks") or [])
+            completed.add(chunk["chunk"])
+            self.progress["asr_completed_chunks"] = sorted(completed)
+            self.progress["asr_chunks_done"] = len(completed)
+        self.progress["asr_chunks_done"] = int(self.progress.get("asr_chunks_done") or 0)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -61,13 +211,138 @@ class JobRecord:
             "error": self.error,
             "duplicate_of": self.duplicate_of,
             "output_files": list(self.output_files),
+            "phase": self.phase,
+            "phase_detail": self.phase_detail,
+            "progress": dict(self.progress),
+            "events": list(self.events),
+            "steps": status_steps(self),
         }
 
 
+def save_job_history(path: Path, jobs: Iterable[JobRecord]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = [job.to_dict() for job in list(jobs)[-MAX_HISTORY:]]
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def load_job_history(path: Path) -> list[JobRecord]:
+    if not path.exists():
+        return []
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        return []
+    jobs = []
+    for item in raw[-MAX_HISTORY:]:
+        if isinstance(item, dict):
+            job = JobRecord.from_dict(item)
+            if job.status in ACTIVE_JOB_STATUSES:
+                job.status = "failed"
+                job.finished_at = job.finished_at or utc_now()
+                job.error = "Server restarted before this job finished."
+                job.record_event("error", job.error)
+            jobs.append(job)
+    return jobs
+
+
+def html_escape(value: Any) -> str:
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def render_status_page(jobs: list[JobRecord]) -> str:
+    latest = jobs[-1] if jobs else None
+    rows = "\n".join(
+        "<tr>"
+        f"<td>{html_escape(job.created_at)}</td>"
+        f"<td>{html_escape(job.job_id)}</td>"
+        f"<td>{html_escape(job.status)}</td>"
+        f"<td>{html_escape(job.phase_detail)}</td>"
+        f"<td><a href=\"/jobs/{html_escape(job.job_id)}\">json</a></td>"
+        "</tr>"
+        for job in reversed(jobs[-20:])
+    )
+    if not rows:
+        rows = "<tr><td colspan=\"5\">No jobs recorded.</td></tr>"
+
+    if latest:
+        steps = "\n".join(
+            "<tr>"
+            f"<td>{html_escape(step['label'])}</td>"
+            f"<td>{html_escape(step['state'])}</td>"
+            f"<td>{html_escape(step['detail'])}</td>"
+            "</tr>"
+            for step in status_steps(latest)
+        )
+        events = "\n".join(
+            "<tr>"
+            f"<td>{html_escape(event.get('at'))}</td>"
+            f"<td>{html_escape(event.get('level'))}</td>"
+            f"<td>{html_escape(event.get('message'))}</td>"
+            "</tr>"
+            for event in reversed(latest.events[-30:])
+        )
+        latest_html = f"""
+        <h2>Latest job</h2>
+        <dl>
+          <dt>Job</dt><dd>{html_escape(latest.job_id)}</dd>
+          <dt>Status</dt><dd>{html_escape(latest.status)}</dd>
+          <dt>Phase</dt><dd>{html_escape(latest.phase_detail)}</dd>
+          <dt>URL</dt><dd><a href="{html_escape(latest.canonical_url)}">{html_escape(latest.canonical_url)}</a></dd>
+          <dt>Created</dt><dd>{html_escape(latest.created_at)}</dd>
+          <dt>Started</dt><dd>{html_escape(latest.started_at)}</dd>
+          <dt>Finished</dt><dd>{html_escape(latest.finished_at)}</dd>
+          <dt>Error</dt><dd>{html_escape(latest.error)}</dd>
+          <dt>Output</dt><dd>{html_escape(", ".join(latest.output_files))}</dd>
+        </dl>
+        <h2>Steps</h2>
+        <table><thead><tr><th>Step</th><th>State</th><th>Detail</th></tr></thead><tbody>{steps}</tbody></table>
+        <h2>Latest events</h2>
+        <table><thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead><tbody>{events}</tbody></table>
+        """
+    else:
+        latest_html = "<h2>Latest job</h2><p>No jobs recorded.</p>"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ytranslate status</title>
+  <style>
+    :root {{ color-scheme: light dark; }}
+    body {{
+      margin: 24px;
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 1180px;
+    }}
+    h1 {{ font-size: 24px; margin: 0 0 18px; }}
+    h2 {{ font-size: 17px; margin: 28px 0 8px; }}
+    table {{ width: 100%; border-collapse: collapse; margin: 8px 0 20px; }}
+    th, td {{ border: 1px solid #999; padding: 6px 8px; text-align: left; vertical-align: top; }}
+    th {{ font-weight: 700; }}
+    dl {{ display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; margin: 0; }}
+    dt {{ font-weight: 700; }}
+    dd {{ margin: 0; overflow-wrap: anywhere; }}
+    a {{ color: LinkText; }}
+  </style>
+  <script>
+    setTimeout(() => location.reload(), 5000);
+  </script>
+</head>
+<body>
+  <h1>ytranslate status</h1>
+  {latest_html}
+  <h2>Recent jobs</h2>
+  <table><thead><tr><th>Created</th><th>Job</th><th>Status</th><th>Phase</th><th>JSON</th></tr></thead><tbody>{rows}</tbody></table>
+</body>
+</html>"""
+
+
 class JobManager:
-    def __init__(self) -> None:
+    def __init__(self, history_file: Optional[Path] = None) -> None:
         self._queue: queue.Queue[str] = queue.Queue()
-        self._jobs: Dict[str, JobRecord] = {}
+        self._history_file = history_file or history_path()
+        loaded_jobs = load_job_history(self._history_file)
+        self._jobs: Dict[str, JobRecord] = {job.job_id: job for job in loaded_jobs}
         self._lock = threading.Lock()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
 
@@ -97,6 +372,8 @@ class JobManager:
                 created_at=utc_now(),
             )
             self._jobs[job.job_id] = job
+            job.record_event("info", "Queued")
+            self._persist_locked()
             self._queue.put(job.job_id)
             return job, False
 
@@ -104,17 +381,38 @@ class JobManager:
         with self._lock:
             return self._jobs.get(job_id)
 
+    def list_jobs(self) -> list[JobRecord]:
+        with self._lock:
+            return sorted(self._jobs.values(), key=lambda job: job.created_at)[-MAX_HISTORY:]
+
+    def latest(self) -> Optional[JobRecord]:
+        jobs = self.list_jobs()
+        return jobs[-1] if jobs else None
+
+    def _persist_locked(self) -> None:
+        save_job_history(
+            self._history_file,
+            sorted(self._jobs.values(), key=lambda job: job.created_at),
+        )
+
     def _update(self, job_id: str, **updates: Any) -> None:
         with self._lock:
             job = self._jobs[job_id]
             for key, value in updates.items():
                 setattr(job, key, value)
+            self._persist_locked()
+
+    def _record_event(self, job_id: str, level: str, message: str) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            job.record_event(level, message)
+            self._persist_locked()
 
     def _worker_loop(self) -> None:
         while True:
             job_id = self._queue.get()
             started_at = utc_now()
-            self._update(job_id, status="running", started_at=started_at)
+            self._update(job_id, status="running", started_at=started_at, phase="metadata", phase_detail="Starting")
             job = self.get(job_id)
             if not job:
                 self._queue.task_done()
@@ -124,6 +422,7 @@ class JobManager:
 
             def log(message: str) -> None:
                 logger.info("job=%s %s", job_id, message)
+                self._record_event(job_id, "info", message)
 
             try:
                 result = ytranslate.run_translation_job(
@@ -136,15 +435,19 @@ class JobManager:
                     job_id,
                     status="succeeded",
                     finished_at=utc_now(),
+                    phase="done",
+                    phase_detail="Finished",
                     docx_path=result.get("docx_path"),
                     pdf_path=result.get("pdf_path"),
                     title=result.get("title"),
                     title_translated=result.get("title_translated"),
                     output_files=result.get("output_files", []),
                 )
+                self._record_event(job_id, "info", f"Completed in {duration:.1f}s")
                 logger.info("job=%s completed in %.1fs", job_id, duration)
             except Exception as exc:
                 duration = time.time() - start_time
+                self._record_event(job_id, "error", str(exc))
                 self._update(
                     job_id,
                     status="failed",
@@ -174,16 +477,41 @@ def make_handler(job_manager: JobManager):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_html(self, status_code: int, html_body: str) -> None:
+            body = html_body.encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_OPTIONS(self) -> None:
             self._send_json(200, {"ok": True})
 
         def do_GET(self) -> None:
-            if self.path == "/health":
+            path = urlparse(self.path).path
+            if path == "/":
+                self._send_html(200, render_status_page(job_manager.list_jobs()))
+                return
+
+            if path == "/health":
                 self._send_json(200, {"ok": True, "status": "healthy"})
                 return
 
-            if self.path.startswith("/jobs/"):
-                job_id = self.path.rsplit("/", 1)[-1]
+            if path == "/jobs":
+                self._send_json(
+                    200,
+                    {"ok": True, "jobs": [job.to_dict() for job in job_manager.list_jobs()]},
+                )
+                return
+
+            if path == "/jobs/latest":
+                job = job_manager.latest()
+                self._send_json(200, {"ok": True, "job": job.to_dict() if job else None})
+                return
+
+            if path.startswith("/jobs/"):
+                job_id = path.rsplit("/", 1)[-1]
                 job = job_manager.get(job_id)
                 if not job:
                     self._send_json(404, {"ok": False, "error": "Job not found"})

@@ -37,11 +37,23 @@ curl http://127.0.0.1:8765/health
 scripts/install-launchagent.sh status
 ```
 
+Open the status page:
+```text
+http://127.0.0.1:8765/
+```
+
+JSON status endpoints:
+```bash
+curl http://127.0.0.1:8765/jobs/latest
+curl http://127.0.0.1:8765/jobs
+```
+
 The LaunchAgent:
 - starts automatically at login
 - keeps the server running
 - runs from this checkout and reads the local `.env`
 - writes logs to `~/Library/Logs/ytranslate/server.log` and `~/Library/Logs/ytranslate/server.err.log`
+- writes recent job status to `~/Library/Application Support/ytranslate/jobs.json`
 
 Stop and remove it:
 ```bash
@@ -65,6 +77,7 @@ The server:
 - prints logs to the terminal when run manually
 - saves `.docx` and `.pdf` to `~/Downloads/`
 - shows a macOS desktop notification on completion
+- uses the status page as the progress and failure surface
 
 ### Manual CLI
 ```bash
@@ -149,8 +162,13 @@ export YOUTUBE_API_KEY=\"...\"
 
 ## Notes
 - Transcript source selection is either/or. A manual YouTube transcript is used only when it clearly includes speaker labels. Otherwise the tool downloads audio and uses OpenAI diarized ASR (`gpt-4o-transcribe-diarize`). It does not fall back to speakerless YouTube auto-captions.
-- OpenAI ASR audio is cached under `~/Library/Caches/ytranslate/` and split into compressed chunks under the upload limit. The default ASR chunk length is 20 minutes, safely below the diarized ASR model's 1400-second limit; override with `OPENAI_ASR_CHUNK_SECONDS` if needed.
+- OpenAI ASR audio is cached under `~/Library/Caches/ytranslate/` and split into compressed chunks under the upload limit. The default ASR chunk length is 10 minutes, chosen for long-run reliability and clearer progress; override with `OPENAI_ASR_CHUNK_SECONDS` if needed.
+- OpenAI ASR uploads use `curl` by default on macOS (`OPENAI_ASR_TRANSPORT=curl`) so large multipart uploads go through the system curl TLS stack. Set `OPENAI_ASR_TRANSPORT=requests` to use Python requests instead.
+- Each ASR chunk has request-level retries and the job can make later passes over only the chunks that failed. Tune with `OPENAI_ASR_MAX_RETRIES`, `OPENAI_ASR_MAX_PASSES`, and `OPENAI_ASR_RETRY_PASS_DELAY_SECONDS`.
+- ASR requests use a separate timeout from text-generation calls. The default is 600 seconds per chunk attempt; override with `OPENAI_ASR_TIMEOUT_SECONDS`.
 - Metadata (title/description) is fetched via the official YouTube Data API to help infer speakers.
 - The Chrome extension talks to `http://127.0.0.1:8765`.
+- The status page at `http://127.0.0.1:8765/` shows the latest job, recent jobs, pipeline steps, ASR chunk progress, output paths, and recent events.
 - The extension displays YouTube-style bottom-left toast notifications for request feedback.
 - On macOS, successful completion sends a desktop notification (no configuration required).
+- OpenAI ASR defaults to one upload at a time for reliability on long episodes. Set `OPENAI_ASR_JOBS=2` or higher only when you prefer speed over lower TLS/upload risk.

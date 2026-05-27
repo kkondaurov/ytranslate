@@ -32,16 +32,20 @@ OPENAI_ASR_MODEL = "gpt-4o-transcribe-diarize"
 OPENAI_TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions"
 DEFAULT_TARGET_LANGUAGE = "Russian"
 OPENAI_TIMEOUT_SECONDS = 1800
+OPENAI_ASR_TIMEOUT_SECONDS = 600
 OPENAI_TEMPERATURE = 0.2
 OPENAI_CLEANUP_TEMPERATURE = 0.0
 OPENAI_ANNOTATION_TEMPERATURE = 0.0
 ASR_MAX_CHUNK_SECONDS = 1400
-ASR_CHUNK_SECONDS = 1200
+ASR_CHUNK_SECONDS = 600
 ASR_AUDIO_BITRATE = "64k"
 ASR_SAMPLE_RATE = "16000"
 ASR_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
-ASR_JOBS = 2
-ASR_MAX_RETRIES = 8
+ASR_JOBS = 1
+ASR_MAX_RETRIES = 3
+ASR_MAX_PASSES = 3
+ASR_RETRY_PASS_DELAY_SECONDS = 30
+OPENAI_ASR_TRANSPORT = "curl"
 DOCX_FONT_NAME = "Arial"
 DOCX_FONT_SIZE = Pt(13)
 DOCX_HEADING_FONT_SIZE = Pt(16)
@@ -520,11 +524,134 @@ def get_asr_chunk_seconds() -> int:
     return chunk_seconds
 
 
+def get_asr_jobs() -> int:
+    raw = os.getenv("OPENAI_ASR_JOBS", str(ASR_JOBS))
+    try:
+        jobs = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"OPENAI_ASR_JOBS must be an integer, got {raw!r}") from exc
+    if jobs <= 0:
+        raise RuntimeError("OPENAI_ASR_JOBS must be positive")
+    return jobs
+
+
+def get_asr_timeout_seconds() -> int:
+    raw = os.getenv("OPENAI_ASR_TIMEOUT_SECONDS", str(OPENAI_ASR_TIMEOUT_SECONDS))
+    try:
+        timeout_seconds = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"OPENAI_ASR_TIMEOUT_SECONDS must be an integer, got {raw!r}") from exc
+    if timeout_seconds <= 0:
+        raise RuntimeError("OPENAI_ASR_TIMEOUT_SECONDS must be positive")
+    return timeout_seconds
+
+
+def get_asr_max_retries() -> int:
+    raw = os.getenv("OPENAI_ASR_MAX_RETRIES", str(ASR_MAX_RETRIES))
+    try:
+        retries = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"OPENAI_ASR_MAX_RETRIES must be an integer, got {raw!r}") from exc
+    if retries <= 0:
+        raise RuntimeError("OPENAI_ASR_MAX_RETRIES must be positive")
+    return retries
+
+
+def get_asr_max_passes() -> int:
+    raw = os.getenv("OPENAI_ASR_MAX_PASSES", str(ASR_MAX_PASSES))
+    try:
+        passes = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"OPENAI_ASR_MAX_PASSES must be an integer, got {raw!r}") from exc
+    if passes <= 0:
+        raise RuntimeError("OPENAI_ASR_MAX_PASSES must be positive")
+    return passes
+
+
+def get_asr_retry_pass_delay_seconds() -> int:
+    raw = os.getenv("OPENAI_ASR_RETRY_PASS_DELAY_SECONDS", str(ASR_RETRY_PASS_DELAY_SECONDS))
+    try:
+        delay_seconds = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"OPENAI_ASR_RETRY_PASS_DELAY_SECONDS must be an integer, got {raw!r}"
+        ) from exc
+    if delay_seconds < 0:
+        raise RuntimeError("OPENAI_ASR_RETRY_PASS_DELAY_SECONDS must not be negative")
+    return delay_seconds
+
+
+def get_asr_transport() -> str:
+    transport = os.getenv("OPENAI_ASR_TRANSPORT", OPENAI_ASR_TRANSPORT).strip().lower()
+    if transport not in {"curl", "requests"}:
+        raise RuntimeError("OPENAI_ASR_TRANSPORT must be either 'curl' or 'requests'")
+    if transport == "curl" and not shutil.which("curl"):
+        return "requests"
+    return transport
+
+
+def curl_config_quote(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "")
+    return f'"{escaped}"'
+
+
+def transcribe_audio_chunk_with_curl(
+    chunk_path: str,
+    openai_key: str,
+    asr_model: str,
+    timeout_seconds: int,
+) -> Dict[str, Any]:
+    curl = shutil.which("curl")
+    if not curl:
+        raise RuntimeError("curl executable not found for OpenAI ASR upload")
+    chunk_name = os.path.basename(chunk_path)
+    form_file = f"file=@{chunk_path};type=audio/mpeg;filename={chunk_name}"
+    config = "\n".join(
+        [
+            f"url = {curl_config_quote(OPENAI_TRANSCRIBE_URL)}",
+            "request = POST",
+            f"header = {curl_config_quote(f'Authorization: Bearer {openai_key}')}",
+            f"form = {curl_config_quote(f'model={asr_model}')}",
+            'form = "response_format=diarized_json"',
+            'form = "chunking_strategy=auto"',
+            f"form = {curl_config_quote(form_file)}",
+            f"max-time = {timeout_seconds}",
+            "connect-timeout = 30",
+            "retry = 2",
+            "retry-delay = 2",
+            "retry-all-errors",
+            "http1.1",
+            "silent",
+            "show-error",
+            "fail-with-body",
+        ]
+    )
+    completed = subprocess.run(
+        [curl, "--config", "-"],
+        input=config,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout_seconds + 45,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"curl ASR upload failed for {chunk_name}: {detail[:1000]}")
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"curl ASR upload returned invalid JSON for {chunk_name}: {completed.stdout[:1000]}"
+        ) from exc
+
+
 def transcribe_audio_chunk(
     chunk_path: str,
     openai_key: str,
     asr_model: str,
     timeout_seconds: int,
+    log: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     headers = {"Authorization": f"Bearer {openai_key}"}
     data = {
@@ -532,10 +659,25 @@ def transcribe_audio_chunk(
         "response_format": "diarized_json",
         "chunking_strategy": "auto",
     }
-    for attempt in range(1, ASR_MAX_RETRIES + 1):
+    chunk_name = os.path.basename(chunk_path)
+    max_retries = get_asr_max_retries()
+    transport = get_asr_transport()
+    for attempt in range(1, max_retries + 1):
+        if log:
+            log(
+                f"OpenAI ASR request attempt {attempt}/{max_retries} "
+                f"for {chunk_name} via {transport} (timeout={timeout_seconds}s)"
+            )
         try:
+            if transport == "curl":
+                return transcribe_audio_chunk_with_curl(
+                    chunk_path,
+                    openai_key,
+                    asr_model,
+                    timeout_seconds,
+                )
             with open(chunk_path, "rb") as audio_file:
-                files = {"file": (os.path.basename(chunk_path), audio_file, "audio/mpeg")}
+                files = {"file": (chunk_name, audio_file, "audio/mpeg")}
                 response = requests.post(
                     OPENAI_TRANSCRIBE_URL,
                     headers=headers,
@@ -543,26 +685,36 @@ def transcribe_audio_chunk(
                     files=files,
                     timeout=timeout_seconds,
                 )
-        except requests.RequestException as exc:
-            if attempt == ASR_MAX_RETRIES:
+        except (requests.RequestException, RuntimeError, subprocess.SubprocessError) as exc:
+            if attempt == max_retries:
                 raise RuntimeError(
-                    f"OpenAI ASR upload failed after retries for {os.path.basename(chunk_path)}: {exc}"
+                    f"OpenAI ASR upload failed after retries for {chunk_name}: {exc}"
                 ) from exc
+            if log:
+                log(
+                    f"OpenAI ASR retryable error on attempt {attempt}/{max_retries} "
+                    f"for {chunk_name}: {exc}"
+                )
             time.sleep(min(60, 5 * attempt))
             continue
 
         if response.status_code < 500 and response.status_code != 429:
             if response.status_code >= 400:
                 raise RuntimeError(
-                    f"OpenAI ASR failed for {os.path.basename(chunk_path)}: "
+                    f"OpenAI ASR failed for {chunk_name}: "
                     f"{response.status_code} {response.text[:1000]}"
                 )
             return response.json()
 
-        if attempt == ASR_MAX_RETRIES:
+        if attempt == max_retries:
             raise RuntimeError(
-                f"OpenAI ASR failed after retries for {os.path.basename(chunk_path)}: "
+                f"OpenAI ASR failed after retries for {chunk_name}: "
                 f"{response.status_code} {response.text[:1000]}"
+            )
+        if log:
+            log(
+                f"OpenAI ASR retryable response on attempt {attempt}/{max_retries} "
+                f"for {chunk_name}: {response.status_code}"
             )
         time.sleep(min(60, 5 * attempt))
 
@@ -1367,7 +1519,10 @@ def transcribe_youtube_audio_with_openai(
 ) -> Dict[str, Any]:
     asr_model = os.getenv("OPENAI_ASR_MODEL", OPENAI_ASR_MODEL)
     chunk_seconds = get_asr_chunk_seconds()
-    jobs = max(1, int(os.getenv("OPENAI_ASR_JOBS", str(ASR_JOBS))))
+    jobs = get_asr_jobs()
+    timeout_seconds = get_asr_timeout_seconds()
+    max_passes = get_asr_max_passes()
+    retry_pass_delay_seconds = get_asr_retry_pass_delay_seconds()
     cache_dir = get_video_cache_dir(video_id)
     result_path = os.path.join(cache_dir, f"openai-asr-{asr_model}-{chunk_seconds}s.json")
     if os.path.exists(result_path):
@@ -1376,6 +1531,7 @@ def transcribe_youtube_audio_with_openai(
     audio_path = download_youtube_audio(url, video_id, log)
     chunks = transcode_and_chunk_audio(audio_path, video_id, chunk_seconds, log)
     offsets = build_chunk_offsets(chunks)
+    log(f"Prepared {len(chunks)} OpenAI ASR chunks ({chunk_seconds}s each, jobs={jobs}).")
     raw_dir = os.path.join(cache_dir, f"openai-asr-chunks-{asr_model}-{chunk_seconds}s")
     os.makedirs(raw_dir, exist_ok=True)
 
@@ -1384,24 +1540,73 @@ def transcribe_youtube_audio_with_openai(
     for index, chunk in enumerate(chunks):
         raw_path = os.path.join(raw_dir, f"{os.path.splitext(os.path.basename(chunk))[0]}.json")
         if os.path.exists(raw_path):
+            log(f"Using cached OpenAI ASR chunk {os.path.basename(chunk)} ({index + 1}/{len(chunks)})")
             raw_by_index[index] = read_json_file(raw_path)
         else:
             pending.append((index, chunk, raw_path))
 
     def run_one(item: Any) -> Any:
         index, chunk, raw_path = item
-        log(f"Running OpenAI ASR on {os.path.basename(chunk)}...")
-        raw = transcribe_audio_chunk(chunk, openai_key, asr_model, OPENAI_TIMEOUT_SECONDS)
+        chunk_name = os.path.basename(chunk)
+        chunk_position = f"({index + 1}/{len(chunks)})"
+        log(f"Running OpenAI ASR on {chunk_name} {chunk_position}")
+        try:
+            raw = transcribe_audio_chunk(
+                chunk,
+                openai_key,
+                asr_model,
+                timeout_seconds,
+                log=lambda message: log(f"{message} {chunk_position}"),
+            )
+        except Exception as exc:
+            log(f"OpenAI ASR failed {chunk_name} ({index + 1}/{len(chunks)}): {exc}")
+            return {
+                "ok": False,
+                "index": index,
+                "chunk": chunk_name,
+                "chunk_path": chunk,
+                "raw_path": raw_path,
+                "error": str(exc),
+            }
         write_json_file(raw_path, raw)
-        return index, raw
+        log(f"OpenAI ASR completed {chunk_name} ({index + 1}/{len(chunks)})")
+        return {
+            "ok": True,
+            "index": index,
+            "chunk": chunk_name,
+            "raw": raw,
+        }
 
-    if pending:
-        worker_count = min(jobs, len(pending))
+    errors = []
+    remaining = pending
+    for pass_number in range(1, max_passes + 1):
+        if not remaining:
+            break
+        if pass_number > 1:
+            if retry_pass_delay_seconds:
+                time.sleep(retry_pass_delay_seconds)
+            log(
+                "Retrying failed OpenAI ASR chunks "
+                f"(pass {pass_number}/{max_passes}, {len(remaining)} remaining)."
+            )
+
+        errors = []
+        worker_count = min(jobs, len(remaining))
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(run_one, item) for item in pending]
+            futures = [executor.submit(run_one, item) for item in remaining]
             for future in as_completed(futures):
-                index, raw = future.result()
-                raw_by_index[index] = raw
+                item = future.result()
+                if item["ok"]:
+                    raw_by_index[item["index"]] = item["raw"]
+                else:
+                    errors.append(item)
+        remaining = [(item["index"], item["chunk_path"], item["raw_path"]) for item in errors]
+
+    if remaining:
+        error_text = "; ".join(f"{item['chunk']}: {item['error']}" for item in errors)
+        raise RuntimeError(
+            f"OpenAI ASR completed {len(raw_by_index)}/{len(chunks)} chunks; failed: {error_text}"
+        )
 
     chunk_results = []
     for index, chunk in enumerate(chunks):
