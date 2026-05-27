@@ -1,6 +1,6 @@
 const BUTTON_HOST_ID = "ytranslate-pdf-button-host";
 const BUTTON_ID = "ytranslate-pdf-button";
-const BUTTON_RENDER_VERSION = "4";
+const BUTTON_RENDER_VERSION = "5";
 const STYLE_ID = "ytranslate-extension-style";
 const TOAST_ROOT_ID = "ytranslate-toast-root";
 const TOAST_ID = "ytranslate-toast";
@@ -61,6 +61,7 @@ function ensureStyles() {
   const cssText = `
     #${BUTTON_HOST_ID} {
       display: inline-flex;
+      flex: 0 0 auto;
       margin-right: 8px;
     }
 
@@ -68,22 +69,26 @@ function ensureStyles() {
       min-width: auto;
     }
 
-    #${BUTTON_ID} .ytranslate-button-icon {
+    #${BUTTON_ID} .ytranslate-button-icon,
+    #${BUTTON_ID} .ytSpecButtonShapeNextIcon,
+    #${BUTTON_ID} .yt-spec-button-shape-next__icon {
       display: inline-flex;
       width: 24px;
       height: 24px;
       align-items: center;
       justify-content: center;
+      flex: 0 0 auto;
     }
 
     #${BUTTON_ID} .ytranslate-button-icon svg {
       display: block;
-      width: 24px;
-      height: 24px;
+      width: 100%;
+      height: 100%;
     }
 
+    #${BUTTON_ID} .ytSpecButtonShapeNextButtonTextContent,
     #${BUTTON_ID} .yt-spec-button-shape-next__button-text-content {
-      letter-spacing: 0.02em;
+      letter-spacing: 0;
     }
 
     #${TOAST_ROOT_ID} {
@@ -185,36 +190,67 @@ function getButtonsContainer() {
 
 function buildPdfIconMarkup() {
   return `
-    <svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 0 24 24" width="24" focusable="false" aria-hidden="true" fill="none" style="pointer-events: none; display: inherit; width: 100%; height: 100%;">
-      <path d="M7 3.5h7.2L18.5 7.8v10.7A1.5 1.5 0 0 1 17 20H7a1.5 1.5 0 0 1-1.5-1.5V5A1.5 1.5 0 0 1 7 3.5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"></path>
-      <path d="M14.2 3.5V7.8h4.3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"></path>
-      <circle cx="10.2" cy="12" r=".85" fill="currentColor"></circle>
-      <circle cx="13.8" cy="12" r=".85" fill="currentColor"></circle>
-      <path d="M9.7 15c.55.55 1.3.85 2.3.85s1.75-.3 2.3-.85" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round"></path>
-    </svg>
+    <span class="ytIconWrapperHost ytranslate-button-icon" style="width: 24px; height: 24px;">
+      <span class="yt-icon-shape ytSpecIconShapeHost">
+        <div style="width: 100%; height: 100%; display: block; fill: currentcolor;">
+          <svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 0 24 24" width="24" focusable="false" aria-hidden="true" style="pointer-events: none; display: inherit; width: 100%; height: 100%;">
+            <path fill-rule="evenodd" clip-rule="evenodd" d="M5 2h9.5L20 7.5V20a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm2 2v16h10a1 1 0 0 0 1-1V9h-5V4H7Zm8 .5V7h2.5L15 4.5Z"></path>
+            <path d="M8 12h8v2H8v-2Zm0 4h6v2H8v-2Z"></path>
+          </svg>
+        </div>
+      </span>
+    </span>
   `;
 }
 
-function createPdfButton(container) {
+function findButtonIcon(button) {
+  return button.querySelector(".ytSpecButtonShapeNextIcon, .yt-spec-button-shape-next__icon");
+}
+
+function findButtonText(button) {
+  return button.querySelector(
+    ".ytSpecButtonShapeNextButtonTextContent, .yt-spec-button-shape-next__button-text-content"
+  );
+}
+
+function createFallbackPdfButton() {
   const button = document.createElement("button");
   button.className =
-    "yt-spec-button-shape-next yt-spec-button-shape-next--tonal yt-spec-button-shape-next--mono yt-spec-button-shape-next--size-m yt-spec-button-shape-next--icon-leading yt-spec-button-shape-next--enable-backdrop-filter-experiment";
+    "ytSpecButtonShapeNextHost ytSpecButtonShapeNextTonal ytSpecButtonShapeNextMono ytSpecButtonShapeNextSizeM ytSpecButtonShapeNextIconLeading ytSpecButtonShapeNextEnableBackdropFilterExperiment";
   button.innerHTML = `
-    <div aria-hidden="true" class="yt-spec-button-shape-next__icon ytranslate-button-icon">${buildPdfIconMarkup()}</div>
-    <div class="yt-spec-button-shape-next__button-text-content">PDF</div>
-    <yt-touch-feedback-shape aria-hidden="true" class="yt-spec-touch-feedback-shape yt-spec-touch-feedback-shape--touch-response">
-      <div class="yt-spec-touch-feedback-shape__stroke"></div>
-      <div class="yt-spec-touch-feedback-shape__fill"></div>
+    <div aria-hidden="true" class="ytSpecButtonShapeNextIcon ytranslate-button-icon">${buildPdfIconMarkup()}</div>
+    <div class="ytSpecButtonShapeNextButtonTextContent">PDF</div>
+    <yt-touch-feedback-shape aria-hidden="true" class="ytSpecTouchFeedbackShapeHost ytSpecTouchFeedbackShapeTouchResponse">
+      <div class="ytSpecTouchFeedbackShapeStroke"></div>
+      <div class="ytSpecTouchFeedbackShapeFill"></div>
     </yt-touch-feedback-shape>
   `;
+  return button;
+}
+
+function createPdfButton(container) {
+  const templateButton = container.querySelector(
+    "yt-button-view-model button[aria-label='Share'], yt-button-view-model button[aria-label^='Share'], button[aria-label='Share'], button[aria-label^='Share']"
+  );
+  let button = templateButton ? templateButton.cloneNode(true) : null;
+  if (!button || !findButtonIcon(button) || !findButtonText(button)) {
+    button = createFallbackPdfButton();
+  }
 
   button.id = BUTTON_ID;
   button.type = "button";
   button.dataset.renderVersion = BUTTON_RENDER_VERSION;
+  button.title = "";
   button.setAttribute("aria-label", "Generate Russian PDF transcript");
   button.removeAttribute("aria-pressed");
 
-  const text = button.querySelector(".yt-spec-button-shape-next__button-text-content");
+  const icon = findButtonIcon(button);
+  if (icon) {
+    icon.classList.add("ytranslate-button-icon");
+    icon.innerHTML = buildPdfIconMarkup();
+  }
+
+  const text = findButtonText(button);
   if (text) {
     text.textContent = "PDF";
   }
