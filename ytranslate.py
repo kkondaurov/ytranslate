@@ -52,7 +52,7 @@ DOCX_HEADING_FONT_SIZE = Pt(16)
 OUTPUT_DIR = os.path.expanduser("~/Downloads")
 CACHE_DIR = os.path.expanduser("~/Library/Caches/ytranslate")
 SPEAKER_OVERRIDES_FILENAME = "speaker-overrides.json"
-TURN_TEXT_PASS_MAX_CHARS = 12_000
+TURN_TEXT_PASS_MAX_CHARS = 6_000
 VOICE_RECONCILIATION_MIN_SEGMENT_SECONDS = 2.4
 VOICE_RECONCILIATION_MAX_SEGMENT_SECONDS = 16.0
 VOICE_RECONCILIATION_MIN_SIMILARITY = 0.86
@@ -1745,28 +1745,32 @@ def build_target_terminology_guidance(target_language: str) -> str:
     )
 
 
+def turn_key(index: int) -> str:
+    return f"turn_{index:04d}"
+
+
+def get_turn_text_map_schema(turn_count: int) -> Dict[str, Any]:
+    properties = {
+        turn_key(index): {"type": "string"}
+        for index in range(1, turn_count + 1)
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties.keys()),
+    }
+
+
 def get_turn_translation_schema(turn_count: int) -> Dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "title_translated": {"type": "string"},
-            "turns": {
-                "type": "array",
-                "minItems": turn_count,
-                "maxItems": turn_count,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "turn_index": {"type": "integer"},
-                        "text_translated": {"type": "string"},
-                    },
-                    "required": ["turn_index", "text_translated"],
-                },
-            },
+            "translations": get_turn_text_map_schema(turn_count),
         },
-        "required": ["title_translated", "turns"],
+        "required": ["title_translated", "translations"],
     }
 
 
@@ -1775,20 +1779,7 @@ def get_turn_cleanup_schema(turn_count: int) -> Dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "turns": {
-                "type": "array",
-                "minItems": turn_count,
-                "maxItems": turn_count,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "turn_index": {"type": "integer"},
-                        "text_translated": {"type": "string"},
-                    },
-                    "required": ["turn_index", "text_translated"],
-                },
-            }
+            "turns": get_turn_text_map_schema(turn_count),
         },
         "required": ["turns"],
     }
@@ -1827,12 +1818,32 @@ def align_turn_texts_by_index(
     return [by_index[idx] for idx in range(1, expected_count + 1)]
 
 
+def align_turn_texts_by_key(
+    returned_turns: Dict[str, Any],
+    expected_count: int,
+    pass_name: str,
+) -> List[str]:
+    if not isinstance(returned_turns, dict):
+        raise RuntimeError(f"{pass_name} pass returned turns in an invalid shape")
+
+    expected_keys = [turn_key(index) for index in range(1, expected_count + 1)]
+    extra = sorted(set(returned_turns) - set(expected_keys))
+    if extra:
+        raise RuntimeError(f"{pass_name} pass returned unexpected turn key {extra[0]}")
+
+    missing = [key for key in expected_keys if key not in returned_turns]
+    if missing:
+        raise RuntimeError(f"{pass_name} pass missing turn key {missing[0]}")
+
+    return [(returned_turns[key] or "").strip() for key in expected_keys]
+
+
 def format_source_turns(turns: List[Dict[str, str]]) -> str:
     lines = []
     for idx, turn in enumerate(turns, 1):
         speaker_id = turn.get("speaker_id") or "speaker"
         text = (turn.get("text_source") or "").strip()
-        lines.append(f"[{idx}] {speaker_id}: {text}")
+        lines.append(f"[{turn_key(idx)}] {speaker_id}: {text}")
     return "\n".join(lines)
 
 
@@ -1842,7 +1853,7 @@ def build_turn_translation_system_prompt(target_language: str) -> str:
         "Translate already attributed dialogue turns into the target language. "
         "Preserve the meaning, tone, and order of the conversation. "
         "Do not change speaker assignment. Do not merge turns. Do not split turns. "
-        "Each returned turn must include the exact turn_index shown in the input brackets. "
+        "Return one translated string for each exact turn key shown in the input brackets. "
         "Do not add information that is not present in the source. "
         "Produce idiomatic, natural-sounding language. "
         "Translate business, financial, and technical jargon into natural target-language phrasing. "
@@ -1884,7 +1895,8 @@ def build_turn_translation_user_prompt(
         + "\n"
         f"{terminology_guidance}\n"
         "Turns to translate (keep order; return one translated text per input turn). "
-        "For every output item, set turn_index to the bracketed input number and do not put speaker labels inside text_translated:\n"
+        "Use the bracketed turn keys as JSON property names under translations. "
+        "Do not put speaker labels inside translated strings:\n"
         f"{format_source_turns(turns)}"
     )
 
@@ -2112,12 +2124,15 @@ def translate_attributed_turns(
     turns: List[Dict[str, str]],
     source_language_hint: Optional[str],
     debug_sink: Optional[List[Dict[str, Any]]] = None,
+    log: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     chunks = chunk_source_turns(turns, max_chars=TURN_TEXT_PASS_MAX_CHARS)
     translated_texts_by_turn: List[str] = [""] * len(turns)
     turn_positions = {id(turn): index for index, turn in enumerate(turns)}
     title_translated = ""
     for chunk_index, chunk in enumerate(chunks, 1):
+        if log:
+            log(f"Translating text chunk {chunk_index}/{len(chunks)} ({len(chunk)} turns)...")
         result = translate_turn_chunk(
             client,
             model,
@@ -2134,13 +2149,15 @@ def translate_attributed_turns(
         )
         if not title_translated:
             title_translated = result.get("title_translated", "")
-        translated_texts = align_turn_texts_by_index(
-            result.get("turns", []),
+        translated_texts = align_turn_texts_by_key(
+            result.get("translations", {}),
             len(chunk),
             f"Translation chunk {chunk_index}",
         )
         for turn, translated_text in zip(chunk, translated_texts):
             translated_texts_by_turn[turn_positions[id(turn)]] = translated_text
+        if log:
+            log(f"Translated text chunk {chunk_index}/{len(chunks)}")
 
     return {
         "title_translated": title_translated,
@@ -2165,7 +2182,7 @@ def format_turns_for_cleanup(turns: List[Dict[str, str]]) -> str:
     for idx, turn in enumerate(turns, 1):
         speaker_id = turn.get("speaker_id") or "speaker"
         text = (turn.get("text_translated") or "").strip()
-        lines.append(f"[{idx}] {speaker_id}: {text}")
+        lines.append(f"[{turn_key(idx)}] {speaker_id}: {text}")
     return "\n".join(lines)
 
 
@@ -2174,7 +2191,7 @@ def build_russian_cleanup_system_prompt() -> str:
         "You are a Russian-language copy editor cleaning up an already translated podcast transcript. "
         "Preserve the meaning, tone, and turn boundaries exactly, but improve wording so it reads like natural, competent Russian. "
         "Do not change speaker order, do not merge or split turns, and do not change which speaker says which turn. "
-        "Each returned turn must include the exact turn_index shown in the input brackets. "
+        "Return one revised string for each exact turn key shown in the input brackets. "
         "Your job is to fix awkward phrasing, mixed-language artifacts, bad grammar, bad glossary glosses, and clumsy brackets. "
         "Assume the reader is intelligent but not an expert in the domain. "
         "Keep helpful bracketed explanations for non-expert readers, but remove or rewrite bad ones. "
@@ -2198,7 +2215,7 @@ def build_russian_annotation_system_prompt() -> str:
         "You are a Russian-language editor adding concise glossary-style clarifications to an already translated podcast transcript. "
         "Preserve wording, meaning, tone, turn boundaries, and speaker assignment exactly. "
         "Do not merge turns, split turns, or rewrite sentences beyond minimal edits needed to insert a bracketed gloss. "
-        "Each returned turn must include the exact turn_index shown in the input brackets. "
+        "Return one revised string for each exact turn key shown in the input brackets. "
         "Assume the reader is intelligent but not an expert in the domain. "
         "Add a short Russian bracketed gloss on first mention only when a specialist term, acronym, metric, industry phrase, or product-specific concept would likely be unclear to a non-expert reader. "
         "Good candidates include terms like SLA, KYC, InMail, RAG, HVAC, InfiniBand, cryptowinter, and quant trader if they appear. "
@@ -2223,8 +2240,8 @@ def build_russian_cleanup_user_prompt(
         f"Transcript title in Russian: {title_translated}\n"
         "Rewrite each turn below into better Russian while preserving meaning exactly. "
         "Keep the same number of turns and the same order. "
-        "For every output item, set turn_index to the bracketed input number. "
-        "Return only revised text_translated values; do not include speaker labels inside the text.\n\n"
+        "Use the bracketed turn keys as JSON property names under turns. "
+        "Return only revised text values; do not include speaker labels inside the text.\n\n"
         "Turns:\n"
         f"{format_turns_for_cleanup(turns)}"
     )
@@ -2238,8 +2255,8 @@ def build_russian_annotation_user_prompt(
         f"Transcript title in Russian: {title_translated}\n"
         "Review each turn below. Keep the same number of turns and the same order. "
         "Only add concise bracketed glosses where they are genuinely helpful for a non-expert reader. "
-        "For every output item, set turn_index to the bracketed input number. "
-        "Return only revised text_translated values; do not include speaker labels inside the text.\n\n"
+        "Use the bracketed turn keys as JSON property names under turns. "
+        "Return only revised text values; do not include speaker labels inside the text.\n\n"
         "Turns:\n"
         f"{format_turns_for_cleanup(turns)}"
     )
@@ -2279,7 +2296,7 @@ def cleanup_russian_turn_chunk(
                 "result": result,
             }
         )
-    return align_turn_texts_by_index(result.get("turns", []), len(turns), "Cleanup")
+    return align_turn_texts_by_key(result.get("turns", {}), len(turns), "Cleanup")
 
 
 def cleanup_russian_turns(
@@ -2288,6 +2305,7 @@ def cleanup_russian_turns(
     title_translated: str,
     turns: List[Dict[str, str]],
     debug_sink: Optional[List[Dict[str, Any]]] = None,
+    log: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, str]]:
     if not turns:
         return turns
@@ -2296,6 +2314,8 @@ def cleanup_russian_turns(
     turn_positions = {id(turn): index for index, turn in enumerate(turns)}
     chunks = chunk_turns_by_chars(turns, max_chars=TURN_TEXT_PASS_MAX_CHARS)
     for chunk_index, chunk in enumerate(chunks, 1):
+        if log:
+            log(f"Cleaning Russian text chunk {chunk_index}/{len(chunks)} ({len(chunk)} turns)...")
         chunk_texts = cleanup_russian_turn_chunk(
             client,
             model,
@@ -2307,6 +2327,8 @@ def cleanup_russian_turns(
         )
         for turn, cleaned_text in zip(chunk, chunk_texts):
             cleaned_texts[turn_positions[id(turn)]] = cleaned_text
+        if log:
+            log(f"Cleaned Russian text chunk {chunk_index}/{len(chunks)}")
 
     if len(cleaned_texts) != len(turns):
         raise RuntimeError("Cleanup pass returned the wrong number of turns")
@@ -2347,7 +2369,7 @@ def annotate_russian_turn_chunk(
                 "result": result,
             }
         )
-    return align_turn_texts_by_index(result.get("turns", []), len(turns), "Annotation")
+    return align_turn_texts_by_key(result.get("turns", {}), len(turns), "Annotation")
 
 
 def annotate_russian_turns(
@@ -2356,6 +2378,7 @@ def annotate_russian_turns(
     title_translated: str,
     turns: List[Dict[str, str]],
     debug_sink: Optional[List[Dict[str, Any]]] = None,
+    log: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, str]]:
     if not turns:
         return turns
@@ -2364,6 +2387,8 @@ def annotate_russian_turns(
     turn_positions = {id(turn): index for index, turn in enumerate(turns)}
     chunks = chunk_turns_by_chars(turns, max_chars=TURN_TEXT_PASS_MAX_CHARS)
     for chunk_index, chunk in enumerate(chunks, 1):
+        if log:
+            log(f"Annotating glossary chunk {chunk_index}/{len(chunks)} ({len(chunk)} turns)...")
         chunk_texts = annotate_russian_turn_chunk(
             client,
             model,
@@ -2375,6 +2400,8 @@ def annotate_russian_turns(
         )
         for turn, annotated_text in zip(chunk, chunk_texts):
             annotated_texts[turn_positions[id(turn)]] = annotated_text
+        if log:
+            log(f"Annotated glossary chunk {chunk_index}/{len(chunks)}")
 
     if len(annotated_texts) != len(turns):
         raise RuntimeError("Annotation pass returned the wrong number of turns")
@@ -2735,6 +2762,7 @@ def run_translation_job(
         attributed.get("turns", []),
         source_language_hint,
         debug_sink=translation_pass_debug if debug else None,
+        log=log,
     )
 
     if debug_dir:
@@ -2755,6 +2783,7 @@ def run_translation_job(
             result.get("title_translated", "").strip() or title,
             result.get("turns", []),
             debug_sink=cleanup_pass_debug if debug else None,
+            log=log,
         )
 
     if debug_dir and cleanup_pass_debug:
@@ -2772,6 +2801,7 @@ def run_translation_job(
             result.get("title_translated", "").strip() or title,
             result.get("turns", []),
             debug_sink=annotation_pass_debug if debug else None,
+            log=log,
         )
 
     if debug_dir and annotation_pass_debug:

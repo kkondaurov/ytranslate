@@ -74,5 +74,17 @@ class JobProgressTests(unittest.TestCase):
         self.assertEqual(loaded[0].events[0]["level"], "error")
 
 
+class JobRetryTests(unittest.TestCase):
+    def test_translation_pass_shape_failure_is_retryable(self):
+        err = RuntimeError("Translation chunk 2 pass returned duplicate turn_index 75")
+
+        self.assertTrue(ytranslate_server.is_retryable_job_error(err))
+
+    def test_configuration_failure_is_not_retryable(self):
+        err = RuntimeError("OPENAI_API_KEY environment variable is required")
+
+        self.assertFalse(ytranslate_server.is_retryable_job_error(err))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,8 @@ CLIENT_HEADER_VALUE = "chrome-extension"
 ACTIVE_JOB_STATUSES = {"queued", "running"}
 MAX_HISTORY = 50
 MAX_EVENTS = 200
+DEFAULT_JOB_MAX_ATTEMPTS = 2
+DEFAULT_JOB_RETRY_DELAY_SECONDS = 15
 DEFAULT_STATE_DIR = Path.home() / "Library" / "Application Support" / "ytranslate"
 DEFAULT_HISTORY_PATH = DEFAULT_STATE_DIR / "jobs.json"
 
@@ -45,6 +47,60 @@ def event_record(level: str, message: str) -> Dict[str, str]:
         "level": level,
         "message": message,
     }
+
+
+def read_nonnegative_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < 0:
+        raise RuntimeError(f"{name} must not be negative")
+    return value
+
+
+def job_max_attempts() -> int:
+    return max(1, read_nonnegative_int_env("YTRANSLATE_JOB_MAX_ATTEMPTS", DEFAULT_JOB_MAX_ATTEMPTS))
+
+
+def job_retry_delay_seconds() -> int:
+    return read_nonnegative_int_env(
+        "YTRANSLATE_JOB_RETRY_DELAY_SECONDS",
+        DEFAULT_JOB_RETRY_DELAY_SECONDS,
+    )
+
+
+def is_retryable_job_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    permanent_markers = [
+        "openai_api_key",
+        "youtube_api_key",
+        "could not extract video id",
+        "transcripts are disabled",
+        "no transcript found",
+        "unsupported url",
+        "must be an integer",
+        "must not be negative",
+    ]
+    if any(marker in message for marker in permanent_markers):
+        return False
+
+    retryable_markers = [
+        "api",
+        "connection",
+        "curl",
+        "timeout",
+        "timed out",
+        "ssl",
+        "rate limit",
+        "temporarily",
+        "server error",
+        "pass returned",
+        "response contained no text",
+        "not valid json",
+    ]
+    return any(marker in message for marker in retryable_markers)
 
 
 def parse_asr_chunk_message(message: str) -> Optional[Dict[str, Any]]:
@@ -425,16 +481,49 @@ class JobManager:
                 self._record_event(job_id, "info", message)
 
             try:
-                result = ytranslate.run_translation_job(
-                    job.canonical_url,
-                    job.target_language,
-                    log=log,
-                )
+                max_attempts = job_max_attempts()
+                retry_delay = job_retry_delay_seconds()
+                result: Optional[Dict[str, Any]] = None
+                for attempt in range(1, max_attempts + 1):
+                    self._update(
+                        job_id,
+                        status="running",
+                        phase="metadata",
+                        phase_detail=f"Starting attempt {attempt}/{max_attempts}",
+                    )
+                    if attempt > 1:
+                        self._record_event(
+                            job_id,
+                            "info",
+                            f"Retrying job attempt {attempt}/{max_attempts}",
+                        )
+                    try:
+                        result = ytranslate.run_translation_job(
+                            job.canonical_url,
+                            job.target_language,
+                            log=log,
+                        )
+                        break
+                    except Exception as exc:
+                        if attempt >= max_attempts or not is_retryable_job_error(exc):
+                            raise
+                        self._record_event(
+                            job_id,
+                            "error",
+                            f"Attempt {attempt}/{max_attempts} failed: {exc}",
+                        )
+                        if retry_delay:
+                            time.sleep(retry_delay)
+
+                if result is None:
+                    raise RuntimeError("Job retry loop finished without a result")
+
                 duration = time.time() - start_time
                 self._update(
                     job_id,
                     status="succeeded",
                     finished_at=utc_now(),
+                    error=None,
                     phase="done",
                     phase_detail="Finished",
                     docx_path=result.get("docx_path"),

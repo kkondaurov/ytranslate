@@ -571,7 +571,19 @@ class RunTranslationJobSourceChoiceTests(unittest.TestCase):
             ],
         }
 
-        def fake_translate(_client, _model, _url, title, _description, _target_language, speakers, turns, _hint, debug_sink=None):
+        def fake_translate(
+            _client,
+            _model,
+            _url,
+            title,
+            _description,
+            _target_language,
+            speakers,
+            turns,
+            _hint,
+            debug_sink=None,
+            log=None,
+        ):
             return {
                 "title_translated": title,
                 "speakers": speakers,
@@ -699,7 +711,27 @@ class TurnTextAlignmentTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing turn_index"):
             ytranslate.align_turn_texts_by_index(returned_turns, 2, "translation")
 
-    def test_translate_attributed_turns_preserves_turn_order_when_model_reorders_results(self):
+    def test_align_turn_texts_by_exact_turn_keys(self):
+        returned_turns = {
+            "turn_0002": "second",
+            "turn_0001": "first",
+        }
+
+        self.assertEqual(
+            ytranslate.align_turn_texts_by_key(returned_turns, 2, "translation"),
+            ["first", "second"],
+        )
+
+    def test_align_turn_texts_by_key_rejects_missing_turn_key(self):
+        returned_turns = {
+            "turn_0001": "first",
+            "turn_0003": "third",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "missing turn key turn_0002"):
+            ytranslate.align_turn_texts_by_key(returned_turns, 3, "translation")
+
+    def test_translate_attributed_turns_preserves_turn_order_from_keyed_results(self):
         turns = [
             {"speaker_id": "speaker_a", "text_source": "Alpha."},
             {"speaker_id": "speaker_a", "text_source": "Beta."},
@@ -709,10 +741,10 @@ class TurnTextAlignmentTests(unittest.TestCase):
         ]
         result_from_model = {
             "title_translated": "Title",
-            "turns": [
-                {"turn_index": 2, "text_translated": "Бета."},
-                {"turn_index": 1, "text_translated": "Альфа."},
-            ],
+            "translations": {
+                "turn_0002": "Бета.",
+                "turn_0001": "Альфа.",
+            },
         }
 
         with patch.object(ytranslate, "translate_turn_chunk", return_value=result_from_model):
@@ -764,10 +796,10 @@ class TurnTextAlignmentTests(unittest.TestCase):
         ):
             return {
                 "title_translated": "Title",
-                "turns": [
-                    {"turn_index": index, "text_translated": turn["text_source"].strip()}
+                "translations": {
+                    ytranslate.turn_key(index): turn["text_source"].strip()
                     for index, turn in enumerate(chunk, 1)
-                ],
+                },
             }
 
         with (
@@ -832,10 +864,10 @@ class TurnTextAlignmentTests(unittest.TestCase):
             seen_chunks.append([turn["speaker_id"] for turn in chunk])
             return {
                 "title_translated": "Title",
-                "turns": [
-                    {"turn_index": index, "text_translated": f"translated:{turn['text_source']}"}
+                "translations": {
+                    ytranslate.turn_key(index): f"translated:{turn['text_source']}"
                     for index, turn in enumerate(chunk, 1)
-                ],
+                },
             }
 
         with patch.object(ytranslate, "translate_turn_chunk", side_effect=fake_translate_chunk):
@@ -992,16 +1024,16 @@ class TurnTextAlignmentTests(unittest.TestCase):
             ["speaker_a", "speaker_b", "speaker_c"],
         )
 
-    def test_cleanup_russian_turn_chunk_aligns_returned_texts_by_turn_index(self):
+    def test_cleanup_russian_turn_chunk_aligns_returned_texts_by_turn_key(self):
         turns = [
             {"speaker_id": "speaker_a", "text_translated": "первый"},
             {"speaker_id": "speaker_b", "text_translated": "второй"},
         ]
         result_from_model = {
-            "turns": [
-                {"turn_index": 2, "text_translated": "второй чистый"},
-                {"turn_index": 1, "text_translated": "первый чистый"},
-            ],
+            "turns": {
+                "turn_0002": "второй чистый",
+                "turn_0001": "первый чистый",
+            },
         }
 
         with patch.object(ytranslate, "call_openai_with_retry", return_value=result_from_model):
@@ -1015,16 +1047,16 @@ class TurnTextAlignmentTests(unittest.TestCase):
                 ["первый чистый", "второй чистый"],
             )
 
-    def test_annotate_russian_turn_chunk_aligns_returned_texts_by_turn_index(self):
+    def test_annotate_russian_turn_chunk_aligns_returned_texts_by_turn_key(self):
         turns = [
             {"speaker_id": "speaker_a", "text_translated": "первый"},
             {"speaker_id": "speaker_b", "text_translated": "второй"},
         ]
         result_from_model = {
-            "turns": [
-                {"turn_index": 2, "text_translated": "второй с пояснением"},
-                {"turn_index": 1, "text_translated": "первый с пояснением"},
-            ],
+            "turns": {
+                "turn_0002": "второй с пояснением",
+                "turn_0001": "первый с пояснением",
+            },
         }
 
         with patch.object(ytranslate, "call_openai_with_retry", return_value=result_from_model):
