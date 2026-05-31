@@ -302,11 +302,11 @@ function App() {
       <main className="layout">
         <div className="left">
           <LatestJob job={latest} />
-          <PhasePanel job={latest} />
           <StepRail steps={latest?.steps ?? []} />
           <EventsTable events={latest?.events ?? []} />
         </div>
         <aside className="right">
+          <PhasePanel job={latest} />
           <RecentJobs jobs={jobs} />
         </aside>
       </main>
