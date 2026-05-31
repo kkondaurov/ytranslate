@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-import html
 import json
 import logging
+import mimetypes
 import os
 import queue
 import re
@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import ytranslate
 
@@ -29,6 +29,7 @@ DEFAULT_JOB_MAX_ATTEMPTS = 2
 DEFAULT_JOB_RETRY_DELAY_SECONDS = 15
 DEFAULT_STATE_DIR = Path.home() / "Library" / "Application Support" / "ytranslate"
 DEFAULT_HISTORY_PATH = DEFAULT_STATE_DIR / "jobs.json"
+FRONTEND_DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 
 logger = logging.getLogger("ytranslate.server")
 
@@ -300,97 +301,37 @@ def load_job_history(path: Path) -> list[JobRecord]:
     return jobs
 
 
-def html_escape(value: Any) -> str:
-    return html.escape("" if value is None else str(value), quote=True)
+def status_payload(jobs: list[JobRecord]) -> Dict[str, Any]:
+    ordered_jobs = sorted(jobs, key=lambda job: job.created_at)[-MAX_HISTORY:]
+    latest = ordered_jobs[-1] if ordered_jobs else None
+    counts: Dict[str, int] = {}
+    for job in ordered_jobs:
+        counts[job.status] = counts.get(job.status, 0) + 1
+
+    return {
+        "ok": True,
+        "generated_at": utc_now(),
+        "latest": latest.to_dict() if latest else None,
+        "jobs": [job.to_dict() for job in reversed(ordered_jobs[-20:])],
+        "counts": counts,
+        "active_jobs": sum(1 for job in ordered_jobs if job.status in ACTIVE_JOB_STATUSES),
+    }
 
 
-def render_status_page(jobs: list[JobRecord]) -> str:
-    latest = jobs[-1] if jobs else None
-    rows = "\n".join(
-        "<tr>"
-        f"<td>{html_escape(job.created_at)}</td>"
-        f"<td>{html_escape(job.job_id)}</td>"
-        f"<td>{html_escape(job.status)}</td>"
-        f"<td>{html_escape(job.phase_detail)}</td>"
-        f"<td><a href=\"/jobs/{html_escape(job.job_id)}\">json</a></td>"
-        "</tr>"
-        for job in reversed(jobs[-20:])
-    )
-    if not rows:
-        rows = "<tr><td colspan=\"5\">No jobs recorded.</td></tr>"
-
-    if latest:
-        steps = "\n".join(
-            "<tr>"
-            f"<td>{html_escape(step['label'])}</td>"
-            f"<td>{html_escape(step['state'])}</td>"
-            f"<td>{html_escape(step['detail'])}</td>"
-            "</tr>"
-            for step in status_steps(latest)
-        )
-        events = "\n".join(
-            "<tr>"
-            f"<td>{html_escape(event.get('at'))}</td>"
-            f"<td>{html_escape(event.get('level'))}</td>"
-            f"<td>{html_escape(event.get('message'))}</td>"
-            "</tr>"
-            for event in reversed(latest.events[-30:])
-        )
-        latest_html = f"""
-        <h2>Latest job</h2>
-        <dl>
-          <dt>Job</dt><dd>{html_escape(latest.job_id)}</dd>
-          <dt>Status</dt><dd>{html_escape(latest.status)}</dd>
-          <dt>Phase</dt><dd>{html_escape(latest.phase_detail)}</dd>
-          <dt>URL</dt><dd><a href="{html_escape(latest.canonical_url)}">{html_escape(latest.canonical_url)}</a></dd>
-          <dt>Created</dt><dd>{html_escape(latest.created_at)}</dd>
-          <dt>Started</dt><dd>{html_escape(latest.started_at)}</dd>
-          <dt>Finished</dt><dd>{html_escape(latest.finished_at)}</dd>
-          <dt>Error</dt><dd>{html_escape(latest.error)}</dd>
-          <dt>Output</dt><dd>{html_escape(", ".join(latest.output_files))}</dd>
-        </dl>
-        <h2>Steps</h2>
-        <table><thead><tr><th>Step</th><th>State</th><th>Detail</th></tr></thead><tbody>{steps}</tbody></table>
-        <h2>Latest events</h2>
-        <table><thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead><tbody>{events}</tbody></table>
-        """
+def frontend_asset_path(path: str) -> Optional[Path]:
+    if path == "/":
+        relative_path = Path("index.html")
     else:
-        latest_html = "<h2>Latest job</h2><p>No jobs recorded.</p>"
+        relative_path = Path(unquote(path.lstrip("/")))
 
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ytranslate status</title>
-  <style>
-    :root {{ color-scheme: light dark; }}
-    body {{
-      margin: 24px;
-      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      max-width: 1180px;
-    }}
-    h1 {{ font-size: 24px; margin: 0 0 18px; }}
-    h2 {{ font-size: 17px; margin: 28px 0 8px; }}
-    table {{ width: 100%; border-collapse: collapse; margin: 8px 0 20px; }}
-    th, td {{ border: 1px solid #999; padding: 6px 8px; text-align: left; vertical-align: top; }}
-    th {{ font-weight: 700; }}
-    dl {{ display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; margin: 0; }}
-    dt {{ font-weight: 700; }}
-    dd {{ margin: 0; overflow-wrap: anywhere; }}
-    a {{ color: LinkText; }}
-  </style>
-  <script>
-    setTimeout(() => location.reload(), 5000);
-  </script>
-</head>
-<body>
-  <h1>ytranslate status</h1>
-  {latest_html}
-  <h2>Recent jobs</h2>
-  <table><thead><tr><th>Created</th><th>Job</th><th>Status</th><th>Phase</th><th>JSON</th></tr></thead><tbody>{rows}</tbody></table>
-</body>
-</html>"""
+    candidate = (FRONTEND_DIST_DIR / relative_path).resolve()
+    try:
+        candidate.relative_to(FRONTEND_DIST_DIR.resolve())
+    except ValueError:
+        return None
+    if candidate.is_file():
+        return candidate
+    return None
 
 
 class JobManager:
@@ -574,17 +515,43 @@ def make_handler(job_manager: JobManager):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_file(self, path: Path) -> None:
+            body = path.read_bytes()
+            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            if path.name == "index.html":
+                self.send_header("Cache-Control", "no-store")
+            else:
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_OPTIONS(self) -> None:
             self._send_json(200, {"ok": True})
 
         def do_GET(self) -> None:
             path = urlparse(self.path).path
             if path == "/":
-                self._send_html(200, render_status_page(job_manager.list_jobs()))
+                index_path = frontend_asset_path(path)
+                if index_path:
+                    self._send_file(index_path)
+                else:
+                    self._send_html(
+                        503,
+                        "<!doctype html><title>ytranslate status</title>"
+                        "<h1>ytranslate status frontend is not built</h1>"
+                        "<p>Run <code>npm --prefix frontend run build</code>.</p>",
+                    )
                 return
 
             if path == "/health":
                 self._send_json(200, {"ok": True, "status": "healthy"})
+                return
+
+            if path == "/api/status":
+                self._send_json(200, status_payload(job_manager.list_jobs()))
                 return
 
             if path == "/jobs":
@@ -606,6 +573,11 @@ def make_handler(job_manager: JobManager):
                     self._send_json(404, {"ok": False, "error": "Job not found"})
                     return
                 self._send_json(200, {"ok": True, "job": job.to_dict()})
+                return
+
+            asset_path = frontend_asset_path(path)
+            if asset_path:
+                self._send_file(asset_path)
                 return
 
             self._send_json(404, {"ok": False, "error": "Not found"})

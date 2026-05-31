@@ -43,19 +43,23 @@ class JobProgressTests(unittest.TestCase):
         self.assertEqual(job.progress["asr_failed_chunks"], ["chunk-000.mp3"])
         self.assertEqual(ytranslate_server.status_steps(job)[5]["detail"], "0 / 3, 1 failed")
 
-    def test_status_page_renders_latest_job_steps(self):
+    def test_status_payload_includes_latest_job_steps(self):
         job = make_job()
         job.record_event("info", "Fetching metadata...")
         job.record_event("info", "Running OpenAI ASR on chunk-000.mp3 (1/2)")
         job.record_event("info", "OpenAI ASR completed chunk-000.mp3 (1/2)")
 
-        html = ytranslate_server.render_status_page([job])
+        payload = ytranslate_server.status_payload([job])
 
-        self.assertIn("ytranslate status", html)
-        self.assertIn("job123", html)
-        self.assertIn("ASR chunks", html)
-        self.assertIn("1 / 2", html)
-        self.assertIn("Fetching metadata", html)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["latest"]["job_id"], "job123")
+        self.assertEqual(payload["latest"]["steps"][5]["label"], "ASR chunks")
+        self.assertEqual(payload["latest"]["steps"][5]["detail"], "1 / 2")
+        self.assertEqual(payload["latest"]["events"][0]["message"], "Fetching metadata...")
+        self.assertEqual(payload["jobs"][0]["job_id"], "job123")
+
+    def test_frontend_asset_path_rejects_traversal(self):
+        self.assertIsNone(ytranslate_server.frontend_asset_path("/../pyproject.toml"))
 
     def test_job_history_round_trips_recent_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:

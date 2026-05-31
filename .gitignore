@@ -5,6 +5,7 @@ __pycache__/
 .DS_Store
 translations/
 *.egg-info/
+frontend/node_modules/
 experiments/asr_compare/output/
 experiments/speaker_audit/output/
 experiments/deepgram_compare/output/

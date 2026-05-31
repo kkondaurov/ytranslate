@@ -44,6 +44,7 @@ http://127.0.0.1:8765/
 
 JSON status endpoints:
 ```bash
+curl http://127.0.0.1:8765/api/status
 curl http://127.0.0.1:8765/jobs/latest
 curl http://127.0.0.1:8765/jobs
 ```
@@ -78,6 +79,12 @@ The server:
 - saves `.docx` and `.pdf` to `~/Downloads/`
 - shows a macOS desktop notification on completion
 - uses the status page as the progress and failure surface
+
+The status UI is a small React/Vite app in `frontend/` and is served by the Python server from `frontend/dist/`. After changing frontend source:
+```bash
+npm --prefix frontend install
+npm --prefix frontend run build
+```
 
 ### Manual CLI
 ```bash
