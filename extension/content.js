@@ -1,6 +1,8 @@
-const BUTTON_HOST_ID = "ytranslate-pdf-button-host";
-const BUTTON_ID = "ytranslate-pdf-button";
-const BUTTON_RENDER_VERSION = "5";
+const PDF_BUTTON_HOST_ID = "ytranslate-pdf-button-host";
+const PDF_BUTTON_ID = "ytranslate-pdf-button";
+const HQ_BUTTON_HOST_ID = "ytranslate-hq-button-host";
+const HQ_BUTTON_ID = "ytranslate-hq-button";
+const BUTTON_RENDER_VERSION = "6";
 const STYLE_ID = "ytranslate-extension-style";
 const TOAST_ROOT_ID = "ytranslate-toast-root";
 const TOAST_ID = "ytranslate-toast";
@@ -59,19 +61,24 @@ function isWatchPage() {
 
 function ensureStyles() {
   const cssText = `
-    #${BUTTON_HOST_ID} {
+    #${PDF_BUTTON_HOST_ID},
+    #${HQ_BUTTON_HOST_ID} {
       display: inline-flex;
       flex: 0 0 auto;
       margin-right: 8px;
     }
 
-    #${BUTTON_ID} {
+    #${PDF_BUTTON_ID},
+    #${HQ_BUTTON_ID} {
       min-width: auto;
     }
 
-    #${BUTTON_ID} .ytranslate-button-icon,
-    #${BUTTON_ID} .ytSpecButtonShapeNextIcon,
-    #${BUTTON_ID} .yt-spec-button-shape-next__icon {
+    #${PDF_BUTTON_ID} .ytranslate-button-icon,
+    #${PDF_BUTTON_ID} .ytSpecButtonShapeNextIcon,
+    #${PDF_BUTTON_ID} .yt-spec-button-shape-next__icon,
+    #${HQ_BUTTON_ID} .ytranslate-button-icon,
+    #${HQ_BUTTON_ID} .ytSpecButtonShapeNextIcon,
+    #${HQ_BUTTON_ID} .yt-spec-button-shape-next__icon {
       display: inline-flex;
       width: 24px;
       height: 24px;
@@ -80,14 +87,17 @@ function ensureStyles() {
       flex: 0 0 auto;
     }
 
-    #${BUTTON_ID} .ytranslate-button-icon svg {
+    #${PDF_BUTTON_ID} .ytranslate-button-icon svg,
+    #${HQ_BUTTON_ID} .ytranslate-button-icon svg {
       display: block;
       width: 100%;
       height: 100%;
     }
 
-    #${BUTTON_ID} .ytSpecButtonShapeNextButtonTextContent,
-    #${BUTTON_ID} .yt-spec-button-shape-next__button-text-content {
+    #${PDF_BUTTON_ID} .ytSpecButtonShapeNextButtonTextContent,
+    #${PDF_BUTTON_ID} .yt-spec-button-shape-next__button-text-content,
+    #${HQ_BUTTON_ID} .ytSpecButtonShapeNextButtonTextContent,
+    #${HQ_BUTTON_ID} .yt-spec-button-shape-next__button-text-content {
       letter-spacing: 0;
     }
 
@@ -203,6 +213,20 @@ function buildPdfIconMarkup() {
   `;
 }
 
+function buildHqIconMarkup() {
+  return `
+    <span class="ytIconWrapperHost ytranslate-button-icon" style="width: 24px; height: 24px;">
+      <span class="yt-icon-shape ytSpecIconShapeHost">
+        <div style="width: 100%; height: 100%; display: block; fill: currentcolor;">
+          <svg xmlns="http://www.w3.org/2000/svg" height="24" viewBox="0 0 24 24" width="24" focusable="false" aria-hidden="true" style="pointer-events: none; display: inherit; width: 100%; height: 100%;">
+            <path d="M12 3 4 7v10l8 4 8-4V7l-8-4Zm0 2.2L17.6 8 12 10.8 6.4 8 12 5.2ZM6 9.6l5 2.5v6.2l-5-2.5V9.6Zm7 8.7v-6.2l5-2.5v6.2l-5 2.5Z"></path>
+          </svg>
+        </div>
+      </span>
+    </span>
+  `;
+}
+
 function findButtonIcon(button) {
   return button.querySelector(".ytSpecButtonShapeNextIcon, .yt-spec-button-shape-next__icon");
 }
@@ -228,6 +252,21 @@ function createFallbackPdfButton() {
   return button;
 }
 
+function createFallbackHqButton() {
+  const button = document.createElement("button");
+  button.className =
+    "ytSpecButtonShapeNextHost ytSpecButtonShapeNextTonal ytSpecButtonShapeNextMono ytSpecButtonShapeNextSizeM ytSpecButtonShapeNextIconLeading ytSpecButtonShapeNextEnableBackdropFilterExperiment";
+  button.innerHTML = `
+    <div aria-hidden="true" class="ytSpecButtonShapeNextIcon ytranslate-button-icon">${buildHqIconMarkup()}</div>
+    <div class="ytSpecButtonShapeNextButtonTextContent">HQ</div>
+    <yt-touch-feedback-shape aria-hidden="true" class="ytSpecTouchFeedbackShapeHost ytSpecTouchFeedbackShapeTouchResponse">
+      <div class="ytSpecTouchFeedbackShapeStroke"></div>
+      <div class="ytSpecTouchFeedbackShapeFill"></div>
+    </yt-touch-feedback-shape>
+  `;
+  return button;
+}
+
 function createPdfButton(container) {
   const templateButton = container.querySelector(
     "yt-button-view-model button[aria-label='Share'], yt-button-view-model button[aria-label^='Share'], button[aria-label='Share'], button[aria-label^='Share']"
@@ -237,7 +276,7 @@ function createPdfButton(container) {
     button = createFallbackPdfButton();
   }
 
-  button.id = BUTTON_ID;
+  button.id = PDF_BUTTON_ID;
   button.type = "button";
   button.dataset.renderVersion = BUTTON_RENDER_VERSION;
   button.title = "";
@@ -309,13 +348,102 @@ function createPdfButton(container) {
   return button;
 }
 
+function createHqButton(container) {
+  const templateButton = container.querySelector(
+    "yt-button-view-model button[aria-label='Share'], yt-button-view-model button[aria-label^='Share'], button[aria-label='Share'], button[aria-label^='Share']"
+  );
+  let button = templateButton ? templateButton.cloneNode(true) : null;
+  if (!button || !findButtonIcon(button) || !findButtonText(button)) {
+    button = createFallbackHqButton();
+  }
+
+  button.id = HQ_BUTTON_ID;
+  button.type = "button";
+  button.dataset.renderVersion = BUTTON_RENDER_VERSION;
+  button.title = "";
+  button.setAttribute("aria-label", "Queue for Personal HQ");
+  button.removeAttribute("aria-pressed");
+
+  const icon = findButtonIcon(button);
+  if (icon) {
+    icon.classList.add("ytranslate-button-icon");
+    icon.innerHTML = buildHqIconMarkup();
+  }
+
+  const text = findButtonText(button);
+  if (text) {
+    text.textContent = "HQ";
+  }
+
+  button.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const now = Date.now();
+    if (now - lastQueuedAt < 1200) {
+      return;
+    }
+    lastQueuedAt = now;
+
+    const canonicalUrl = getCanonicalShareUrl();
+    if (!canonicalUrl) {
+      showToast("Could not read this video URL");
+      return;
+    }
+
+    chrome.runtime.sendMessage(
+      {
+        type: "queuePersonalHQ",
+        url: canonicalUrl
+      },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          showToast("Personal HQ server offline");
+          return;
+        }
+
+        if (!response || !response.ok) {
+          if (response && response.status === 403) {
+            showToast("Personal HQ request rejected");
+            return;
+          }
+          if (response && response.status === 400) {
+            showToast("Could not queue for Personal HQ");
+            return;
+          }
+          showToast("Personal HQ server offline");
+          return;
+        }
+
+        const payload = response.payload || {};
+        if (payload.duplicate) {
+          showToast("Already queued for Personal HQ");
+          return;
+        }
+        if (payload.catalog_status) {
+          showToast("Already in Personal HQ");
+          return;
+        }
+
+        showToast("Queued for Personal HQ");
+      }
+    );
+  });
+
+  return button;
+}
+
 function injectButton() {
   injectionScheduled = false;
 
-  const existingHost = document.getElementById(BUTTON_HOST_ID);
+  const existingPdfHost = document.getElementById(PDF_BUTTON_HOST_ID);
+  const existingHqHost = document.getElementById(HQ_BUTTON_HOST_ID);
   if (!isWatchPage()) {
-    if (existingHost) {
-      existingHost.remove();
+    if (existingPdfHost) {
+      existingPdfHost.remove();
+    }
+    if (existingHqHost) {
+      existingHqHost.remove();
     }
     return;
   }
@@ -325,30 +453,45 @@ function injectButton() {
     return;
   }
 
-  const existingButton = existingHost ? existingHost.querySelector(`#${BUTTON_ID}`) : null;
+  const existingPdfButton = existingPdfHost ? existingPdfHost.querySelector(`#${PDF_BUTTON_ID}`) : null;
+  const existingHqButton = existingHqHost ? existingHqHost.querySelector(`#${HQ_BUTTON_ID}`) : null;
   if (
-    existingHost &&
-    existingHost.parentElement === container &&
-    existingButton &&
-    existingButton.dataset.renderVersion === BUTTON_RENDER_VERSION
+    existingPdfHost &&
+    existingPdfHost.parentElement === container &&
+    existingPdfButton &&
+    existingPdfButton.dataset.renderVersion === BUTTON_RENDER_VERSION &&
+    existingHqHost &&
+    existingHqHost.parentElement === container &&
+    existingHqButton &&
+    existingHqButton.dataset.renderVersion === BUTTON_RENDER_VERSION
   ) {
     ensureStyles();
     ensureToastRoot();
     return;
   }
 
-  if (existingHost) {
-    existingHost.remove();
+  if (existingPdfHost) {
+    existingPdfHost.remove();
+  }
+  if (existingHqHost) {
+    existingHqHost.remove();
   }
 
   ensureStyles();
   ensureToastRoot();
 
-  const host = document.createElement("div");
-  host.id = BUTTON_HOST_ID;
-  host.className = "ytd-menu-renderer";
-  host.appendChild(createPdfButton(container));
-  container.insertBefore(host, container.firstElementChild);
+  const pdfHost = document.createElement("div");
+  pdfHost.id = PDF_BUTTON_HOST_ID;
+  pdfHost.className = "ytd-menu-renderer";
+  pdfHost.appendChild(createPdfButton(container));
+
+  const hqHost = document.createElement("div");
+  hqHost.id = HQ_BUTTON_HOST_ID;
+  hqHost.className = "ytd-menu-renderer";
+  hqHost.appendChild(createHqButton(container));
+
+  container.insertBefore(pdfHost, container.firstElementChild);
+  container.insertBefore(hqHost, container.firstElementChild);
 }
 
 function scheduleInjection() {

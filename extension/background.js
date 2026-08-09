@@ -1,17 +1,21 @@
 const SERVER_BASE_URL = "http://127.0.0.1:8765";
+const PERSONAL_HQ_SERVER_BASE_URL = "http://127.0.0.1:8766";
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message || message.type !== "queueTranslation" || !message.url) {
+  if (!message || !message.url || !["queueTranslation", "queuePersonalHQ"].includes(message.type)) {
     return false;
   }
 
   (async () => {
     try {
-      const response = await fetch(`${SERVER_BASE_URL}/jobs`, {
+      const isPersonalHQ = message.type === "queuePersonalHQ";
+      const clientHeader = isPersonalHQ ? "X-Personal-HQ-Client" : "X-YTranslate-Client";
+      const clientHeaderValue = isPersonalHQ ? "youtube-extension" : "chrome-extension";
+      const response = await fetch(`${isPersonalHQ ? PERSONAL_HQ_SERVER_BASE_URL : SERVER_BASE_URL}${isPersonalHQ ? "/youtube/enqueue" : "/jobs"}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-YTranslate-Client": "chrome-extension"
+          [clientHeader]: clientHeaderValue
         },
         body: JSON.stringify({ url: message.url })
       });
