@@ -24,4 +24,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["ytranslate", "ytranslate_server"]
+py-modules = [
+  "ytranslate",
+  "ytranslate_server",
+  "speaker_identity_linker",
+  "all_in_speaker_reference_bank",
+]

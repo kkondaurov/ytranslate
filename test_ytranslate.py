@@ -11,6 +11,263 @@ class OpenAICallTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "JSON schema must be provided"):
             ytranslate.call_openai(Mock(), "gpt-test", "system", "user")
 
+    def test_call_openai_uses_reasoning_without_temperature(self):
+        class Responses:
+            def __init__(self):
+                self.kwargs = None
+
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                return Mock(output_text='{"value": "ok"}')
+
+        responses = Responses()
+        client = Mock(responses=responses)
+        result = ytranslate.call_openai(
+            client,
+            "gpt-test",
+            "system",
+            "user",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
+            temperature=0.0,
+            reasoning_effort="low",
+        )
+
+        self.assertEqual(result, {"value": "ok"})
+        self.assertEqual(responses.kwargs["reasoning"], {"effort": "low"})
+        self.assertNotIn("temperature", responses.kwargs)
+
+
+class SpeakerIdentityLinkerProductionTests(unittest.TestCase):
+    def test_boundary_cache_is_reused_only_for_matching_input(self):
+        segments = [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "chunk_index": 0,
+                "local_speaker": "A",
+                "text": "First.",
+            },
+            {
+                "start": 1.0,
+                "end": 2.0,
+                "chunk_index": 0,
+                "local_speaker": "A",
+                "text": "Second.",
+            },
+        ]
+        model_result = {
+            "boundaries": [
+                {"segment_id": 0, "boundary_before": "change"},
+                {"segment_id": 1, "boundary_before": "same"},
+            ]
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            patch.object(ytranslate, "CACHE_DIR", tmp_dir),
+            patch.object(
+                ytranslate,
+                "call_openai_with_retry",
+                return_value=model_result,
+            ) as call_mock,
+        ):
+            first, first_debug = ytranslate.infer_speaker_identity_boundaries(
+                Mock(), "video", "Title", "Context", segments, lambda _message: None
+            )
+            second, second_debug = ytranslate.infer_speaker_identity_boundaries(
+                Mock(), "video", "Title", "Context", segments, lambda _message: None
+            )
+            changed = [dict(segment) for segment in segments]
+            changed[1]["text"] = "Changed input."
+            ytranslate.infer_speaker_identity_boundaries(
+                Mock(), "video", "Title", "Context", changed, lambda _message: None
+            )
+
+        self.assertEqual(first, ["change", "same"])
+        self.assertEqual(second, first)
+        self.assertEqual(first_debug["cache_hits"], 0)
+        self.assertEqual(second_debug["cache_hits"], 1)
+        self.assertEqual(call_mock.call_count, 2)
+        self.assertEqual(
+            call_mock.call_args.kwargs["reasoning_effort"],
+            ytranslate.SPEAKER_IDENTITY_LINKER_REASONING_EFFORT,
+        )
+
+    def test_linker_skips_non_all_in_show_without_side_effects(self):
+        segments = [
+            {"speaker_id": "speaker_host", "start": 0.0, "end": 3.0, "text": "Hi"}
+        ]
+        speakers = [
+            {"id": "speaker_host", "label_short": "Host", "label_full": "Host"},
+            {"id": "speaker_guest", "label_short": "Guest", "label_full": "Guest"},
+        ]
+
+        resolved, effective, debug = ytranslate.run_speaker_identity_linker(
+            Mock(),
+            "https://youtu.be/video",
+            "video",
+            {"title": "Other show", "channelTitle": "Other"},
+            segments,
+            speakers,
+            lambda _message: None,
+        )
+
+        self.assertEqual(debug, {"status": "skipped", "reason": "unsupported-show"})
+        self.assertEqual(effective, speakers)
+        self.assertEqual(resolved[0]["speaker_label"], "Host")
+
+    def test_linker_failure_preserves_baseline(self):
+        segments = [
+            {
+                "speaker_id": "speaker_jason_calacanis",
+                "start": 0.0,
+                "end": 3.0,
+                "text": "Hi",
+            }
+        ]
+        speakers = [
+            {
+                "id": "speaker_jason_calacanis",
+                "label_short": "Jason",
+                "label_full": "Jason Calacanis",
+            },
+            {
+                "id": "speaker_david_sacks",
+                "label_short": "Sacks",
+                "label_full": "David Sacks",
+            },
+        ]
+        with patch.object(
+            ytranslate,
+            "download_youtube_audio",
+            side_effect=RuntimeError("test failure"),
+        ):
+            resolved, effective, debug = ytranslate.run_speaker_identity_linker(
+                Mock(),
+                "https://youtu.be/video",
+                "video",
+                {"title": "All-In", "channelTitle": "All-In Podcast"},
+                segments,
+                speakers,
+                lambda _message: None,
+            )
+
+        self.assertEqual(debug["status"], "skipped")
+        self.assertIn("test failure", debug["error"])
+        self.assertEqual(effective, speakers)
+        self.assertEqual(resolved[0]["speaker_id"], "speaker_jason_calacanis")
+        self.assertEqual(resolved[0]["speaker_label"], "Jason Calacanis")
+
+    def test_linked_labels_reuse_existing_public_speaker_ids(self):
+        normalized = ytranslate.normalize_linked_speaker_ids(
+            [
+                {
+                    "speaker_id": "speaker_friedberg",
+                    "speaker_label": "Friedberg",
+                },
+                {
+                    "speaker_id": "speaker_unknown_external",
+                    "speaker_label": "Unknown/External",
+                },
+            ],
+            [
+                {
+                    "id": "speaker_david_friedberg",
+                    "label_short": "Friedberg",
+                    "label_full": "David Friedberg",
+                }
+            ],
+        )
+
+        self.assertEqual(normalized[0]["speaker_id"], "speaker_david_friedberg")
+        self.assertEqual(
+            normalized[0]["speaker_id_before_identity_normalization"],
+            "speaker_friedberg",
+        )
+        self.assertEqual(normalized[1]["speaker_id"], "speaker_unknown_external")
+
+
+class RenderTranscriptTests(unittest.TestCase):
+    def test_render_docx_strips_duplicate_speaker_prefix_from_translated_text(self):
+        from docx import Document
+
+        speakers = [
+            {
+                "id": "speaker_jason_calacanis",
+                "label_short": "Jason",
+                "label_full": "Jason Calacanis",
+            }
+        ]
+        turns = [
+            {
+                "speaker_id": "speaker_jason_calacanis",
+                "text_translated": "Jason: Привет всем.",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = Path(tmp_dir) / "transcript.docx"
+            ytranslate.render_docx("Заголовок", speakers, turns, str(output_path))
+            paragraphs = [
+                paragraph.text
+                for paragraph in Document(str(output_path)).paragraphs
+                if paragraph.text.strip()
+            ]
+
+        self.assertIn("Jason: Привет всем.", paragraphs)
+        self.assertNotIn("Jason: Jason: Привет всем.", paragraphs)
+
+    def test_render_source_pdf_uses_source_text_and_en_suffix(self):
+        speakers = [
+            {
+                "id": "speaker_host",
+                "label_short": "Host",
+                "label_full": "Host Name",
+            }
+        ]
+        turns = [
+            {
+                "speaker_id": "speaker_host",
+                "text_source": "Original English text.",
+            }
+        ]
+
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            patch.object(ytranslate, "render_docx") as render_mock,
+            patch.object(
+                ytranslate,
+                "convert_docx_to_pdf",
+                return_value=str(Path(tmp_dir) / "Video-Title_EN.pdf"),
+            ) as convert_mock,
+        ):
+            pdf_path = ytranslate.render_source_pdf(
+                "Video Title",
+                speakers,
+                turns,
+                tmp_dir,
+            )
+
+        temporary_docx = str(Path(tmp_dir) / "Video-Title_EN.docx")
+        self.assertEqual(pdf_path, str(Path(tmp_dir) / "Video-Title_EN.pdf"))
+        render_mock.assert_called_once_with(
+            "Video Title",
+            speakers,
+            [
+                {
+                    "speaker_id": "speaker_host",
+                    "text_source": "Original English text.",
+                    "text_translated": "Original English text.",
+                }
+            ],
+            temporary_docx,
+        )
+        convert_mock.assert_called_once_with(temporary_docx)
+
 
 class TranscriptSourceTests(unittest.TestCase):
     def test_generated_speakerless_youtube_transcript_is_not_high_quality(self):
@@ -377,6 +634,299 @@ class DiarizedAsrTests(unittest.TestCase):
             ],
         )
 
+    def test_enrich_video_metadata_preserves_channel_title_and_tags(self):
+        item = {
+            "snippet": {
+                "title": "Anthropic's Fable Backlash",
+                "description": "Besties are back.",
+                "channelTitle": "All-In Podcast",
+                "channelId": "UCESLZhusAkFfsNsApnjF_Cg",
+                "tags": [
+                    "chamath",
+                    "david sacks",
+                    "david friedberg",
+                    "jason calacanis",
+                ],
+                "defaultLanguage": "en",
+                "defaultAudioLanguage": "en-US",
+            }
+        }
+
+        metadata = ytranslate.metadata_from_youtube_item(item)
+
+        self.assertEqual(metadata["channelTitle"], "All-In Podcast")
+        self.assertEqual(metadata["channelId"], "UCESLZhusAkFfsNsApnjF_Cg")
+        self.assertIn("jason calacanis", metadata["tags"])
+
+    def test_known_speaker_roster_uses_all_in_channel_and_tags(self):
+        metadata = {
+            "channelTitle": "All-In Podcast",
+            "tags": ["chamath", "david sacks", "david friedberg", "jason calacanis"],
+        }
+
+        roster = ytranslate.infer_known_speaker_roster(metadata)
+
+        self.assertEqual(
+            roster,
+            [
+                {
+                    "id": "speaker_jason_calacanis",
+                    "label_short": "Jason",
+                    "label_full": "Jason Calacanis",
+                    "aliases": ["jason", "j-cal", "jcal", "j cal"],
+                },
+                {
+                    "id": "speaker_chamath_palihapitiya",
+                    "label_short": "Chamath",
+                    "label_full": "Chamath Palihapitiya",
+                    "aliases": ["chamath", "chumath", "jamath"],
+                },
+                {
+                    "id": "speaker_david_sacks",
+                    "label_short": "Sacks",
+                    "label_full": "David Sacks",
+                    "aliases": ["sacks", "zach", "sachs", "david sacks"],
+                },
+                {
+                    "id": "speaker_david_friedberg",
+                    "label_short": "Friedberg",
+                    "label_full": "David Friedberg",
+                    "aliases": ["friedberg", "freeberg", "freiberg", "david friedberg"],
+                },
+            ],
+        )
+
+    def test_handoff_evidence_maps_all_in_opening_speakers(self):
+        segments = [
+            {
+                "chunk_index": 1,
+                "local_speaker": "A",
+                "speaker": "A",
+                "start": 0,
+                "end": 10,
+                "text": "All right, everybody, welcome back. I'm going to stop there, Chamath. What's your take?",
+            },
+            {
+                "chunk_index": 1,
+                "local_speaker": "B",
+                "speaker": "B",
+                "start": 10.1,
+                "end": 22,
+                "text": "It's a really incredible model.",
+            },
+            {
+                "chunk_index": 1,
+                "local_speaker": "A",
+                "speaker": "A",
+                "start": 30,
+                "end": 39,
+                "text": "Friedberg running your own company, do you worry?",
+            },
+            {
+                "chunk_index": 1,
+                "local_speaker": "C",
+                "speaker": "C",
+                "start": 39.1,
+                "end": 50,
+                "text": "It's a great question.",
+            },
+            {
+                "chunk_index": 1,
+                "local_speaker": "A",
+                "speaker": "A",
+                "start": 510,
+                "end": 514,
+                "text": "Sacks, what's your take? How's this chessboard developing here?",
+            },
+            {
+                "chunk_index": 1,
+                "local_speaker": "A",
+                "speaker": "A",
+                "start": 514,
+                "end": 599.8,
+                "text": "There is a long setup before the next speaker answers.",
+            },
+            {
+                "chunk_index": 1,
+                "local_speaker": "D",
+                "speaker": "D",
+                "start": 599.9,
+                "end": 600,
+                "text": "Well, look, eight months ago,",
+            },
+        ]
+        roster = ytranslate.infer_known_speaker_roster(
+            {
+                "channelTitle": "All-In Podcast",
+                "tags": ["chamath", "david sacks", "david friedberg", "jason calacanis"],
+            }
+        )
+
+        evidence = ytranslate.build_speaker_identity_evidence(segments, roster)
+
+        self.assertEqual(
+            evidence["trusted_local_speakers"][(1, "A")]["speaker_id"],
+            "speaker_jason_calacanis",
+        )
+        self.assertEqual(
+            evidence["trusted_local_speakers"][(1, "B")]["speaker_id"],
+            "speaker_chamath_palihapitiya",
+        )
+        self.assertEqual(
+            evidence["trusted_local_speakers"][(1, "C")]["speaker_id"],
+            "speaker_david_friedberg",
+        )
+        self.assertEqual(
+            evidence["trusted_local_speakers"][(1, "D")]["speaker_id"],
+            "speaker_david_sacks",
+        )
+
+    def test_boundary_continuation_maps_mid_sentence_next_chunk_speaker(self):
+        segments = [
+            {
+                "chunk_index": 1,
+                "local_speaker": "D",
+                "speaker": "D",
+                "start": 598,
+                "end": 600,
+                "text": "Well, look, eight months ago, I said that Anthropic was engaged in a very...",
+            },
+            {
+                "chunk_index": 2,
+                "local_speaker": "A",
+                "speaker": "A",
+                "start": 600,
+                "end": 604,
+                "text": "sophisticated regulatory capture campaign based on fear mongering.",
+            },
+        ]
+        trusted = {
+            (1, "D"): {
+                "speaker_id": "speaker_david_sacks",
+                "reason": "direct-address-response",
+                "confidence": 0.98,
+            }
+        }
+
+        evidence = ytranslate.build_boundary_continuity_evidence(segments, trusted)
+
+        self.assertEqual(
+            evidence[(2, "A")]["speaker_id"],
+            "speaker_david_sacks",
+        )
+        self.assertEqual(evidence[(2, "A")]["reason"], "chunk-boundary-continuation")
+
+    def test_handoff_questioner_evidence_maps_all_in_moderator_to_jason(self):
+        segments = [
+            {
+                "chunk_index": 10,
+                "local_speaker": "B",
+                "speaker": "B",
+                "start": 5600,
+                "end": 5602,
+                "text": "Sacks, you want to add anything as we wrap here on",
+            },
+            {
+                "chunk_index": 10,
+                "local_speaker": "C",
+                "speaker": "C",
+                "start": 5602,
+                "end": 5606,
+                "text": "Yeah, the party told you to reject the evidence of your eyes and ears.",
+            },
+        ]
+        roster = ytranslate.infer_known_speaker_roster(
+            {
+                "channelTitle": "All-In Podcast",
+                "tags": ["chamath", "david sacks", "david friedberg", "jason calacanis"],
+            }
+        )
+
+        evidence = ytranslate.build_speaker_identity_evidence(segments, roster)
+
+        self.assertEqual(
+            evidence["trusted_local_speakers"][(10, "B")]["speaker_id"],
+            "speaker_jason_calacanis",
+        )
+        self.assertEqual(
+            evidence["trusted_local_speakers"][(10, "C")]["speaker_id"],
+            "speaker_david_sacks",
+        )
+
+    def test_speaker_mapping_evidence_overrides_wrong_model_mapping(self):
+        speaker_mapping = {
+            "speakers": [
+                {
+                    "id": "speaker_chamath_palihapitiya",
+                    "label_short": "Chamath",
+                    "label_full": "Chamath Palihapitiya",
+                },
+                {
+                    "id": "speaker_jason_calacanis",
+                    "label_short": "Jason",
+                    "label_full": "Jason Calacanis",
+                },
+            ],
+            "local_speakers": [
+                {
+                    "chunk_index": 1,
+                    "local_speaker": "A",
+                    "speaker_id": "speaker_chamath_palihapitiya",
+                },
+            ],
+        }
+        evidence = {
+            "speakers": [
+                {
+                    "id": "speaker_jason_calacanis",
+                    "label_short": "Jason",
+                    "label_full": "Jason Calacanis",
+                }
+            ],
+            "trusted_local_speakers": {
+                (1, "A"): {
+                    "speaker_id": "speaker_jason_calacanis",
+                    "reason": "show-host-opening",
+                    "confidence": 0.95,
+                }
+            },
+        }
+
+        effective = ytranslate.apply_speaker_identity_evidence(speaker_mapping, evidence)
+
+        self.assertEqual(
+            effective["local_speakers"],
+            [
+                {
+                    "chunk_index": 1,
+                    "local_speaker": "A",
+                    "speaker_id": "speaker_jason_calacanis",
+                    "speaker_id_source": "show-host-opening",
+                }
+            ],
+        )
+
+    def test_contradiction_check_flags_speaker_referring_to_self(self):
+        speakers = [
+            {
+                "id": "speaker_david_friedberg",
+                "label_short": "Friedberg",
+                "label_full": "David Friedberg",
+            }
+        ]
+        turns = [
+            {
+                "speaker_id": "speaker_david_friedberg",
+                "text_source": "Bro, the ballot harvesters did it. What Freeberg said just happened is just that.",
+            }
+        ]
+
+        issues = ytranslate.find_speaker_identity_contradictions(speakers, turns)
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["speaker_id"], "speaker_david_friedberg")
+        self.assertEqual(issues[0]["matched_alias"], "freeberg")
+
     def test_local_speaker_mapping_is_applied_before_merging_turns(self):
         segments = [
             {"chunk_index": 1, "local_speaker": "A", "speaker": "A", "text": "Alice first."},
@@ -510,6 +1060,151 @@ class DiarizedAsrTests(unittest.TestCase):
             ],
         )
 
+    def test_voice_reconciliation_backfills_short_same_local_segments_from_next_voice_match(self):
+        segments = [
+            {"chunk_index": 1, "local_speaker": "A", "speaker": "A", "start": 0, "end": 8, "text": "Alice anchor."},
+            {"chunk_index": 1, "local_speaker": "B", "speaker": "B", "start": 10, "end": 18, "text": "Bob anchor."},
+            {"chunk_index": 2, "local_speaker": "B", "speaker": "B", "start": 20, "end": 20.4, "text": "short one"},
+            {"chunk_index": 2, "local_speaker": "B", "speaker": "B", "start": 20.5, "end": 21.0, "text": "short two"},
+            {"chunk_index": 2, "local_speaker": "B", "speaker": "B", "start": 21.1, "end": 27, "text": "This is actually Alice."},
+        ]
+        speaker_mapping = {
+            "speakers": [
+                {"id": "speaker_alice", "label_short": "Alice", "label_full": "Alice"},
+                {"id": "speaker_bob", "label_short": "Bob", "label_full": "Bob"},
+            ],
+            "local_speakers": [
+                {"chunk_index": 1, "local_speaker": "A", "speaker_id": "speaker_alice"},
+                {"chunk_index": 1, "local_speaker": "B", "speaker_id": "speaker_bob"},
+                {"chunk_index": 2, "local_speaker": "B", "speaker_id": "speaker_bob"},
+            ],
+        }
+        embeddings = {
+            0: [1.0, 0.0],
+            1: [0.0, 1.0],
+            4: [1.0, 0.01],
+        }
+
+        resolved, debug = ytranslate.reconcile_segment_speakers_with_voice_embeddings(
+            segments,
+            speaker_mapping,
+            embeddings,
+            min_similarity=0.8,
+            min_margin=0.2,
+            neighbor_gap_seconds=1.0,
+        )
+
+        self.assertEqual(resolved[2]["speaker_id"], "speaker_alice")
+        self.assertEqual(resolved[2]["speaker_id_source"], "voice_neighbor")
+        self.assertEqual(resolved[3]["speaker_id"], "speaker_alice")
+        self.assertEqual(resolved[3]["speaker_id_source"], "voice_neighbor")
+        self.assertEqual(resolved[4]["speaker_id"], "speaker_alice")
+        self.assertEqual(debug["neighbor_assigned_count"], 2)
+
+    def test_role_speaker_merges_into_named_speaker_when_voice_shares_local_stream(self):
+        speakers = [
+            {
+                "id": "speaker_patrick",
+                "label_short": "Patrick O'Shaughnessy",
+                "label_full": "Patrick O'Shaughnessy",
+            },
+            {
+                "id": "speaker_alex",
+                "label_short": "Alex Sacerdote",
+                "label_full": "Alex Sacerdote",
+            },
+            {
+                "id": "speaker_ad",
+                "label_short": "Ad read",
+                "label_full": "Advertisement / Sponsor read",
+            },
+        ]
+        segments = [
+            {
+                "chunk_index": 2,
+                "local_speaker": "C",
+                "speaker_id": "speaker_ad",
+                "speaker_id_source": "voice",
+                "start": 744.0,
+                "end": 750.0,
+                "text": "Ramp does the exact opposite.",
+            },
+            {
+                "chunk_index": 2,
+                "local_speaker": "C",
+                "speaker_id": "speaker_patrick",
+                "speaker_id_source": "voice",
+                "start": 883.0,
+                "end": 890.0,
+                "text": "How do you get the allocation you want?",
+            },
+            {
+                "chunk_index": 3,
+                "local_speaker": "C",
+                "speaker_id": "speaker_ad",
+                "speaker_id_source": "local_mapping",
+                "start": 1786.0,
+                "end": 1789.0,
+                "text": "What else did you learn? That's fascinating.",
+            },
+            {
+                "chunk_index": 9,
+                "local_speaker": "A",
+                "speaker_id": "speaker_ad",
+                "speaker_id_source": "voice",
+                "start": 4800.0,
+                "end": 4804.0,
+                "text": "Visit workos.com.",
+            },
+        ]
+
+        merged_segments, merged_speakers, debug = ytranslate.collapse_role_speaker_identities(
+            segments,
+            speakers,
+        )
+
+        self.assertEqual(
+            [segment["speaker_id"] for segment in merged_segments],
+            ["speaker_patrick"] * 4,
+        )
+        self.assertNotIn("speaker_ad", {speaker["id"] for speaker in merged_speakers})
+        self.assertEqual(debug["merged_role_speakers"], {"speaker_ad": "speaker_patrick"})
+
+    def test_role_speaker_remains_separate_without_named_voice_overlap(self):
+        speakers = [
+            {"id": "speaker_host", "label_short": "Host", "label_full": "Host"},
+            {
+                "id": "speaker_ad",
+                "label_short": "Ad read",
+                "label_full": "Advertisement / Sponsor read",
+            },
+        ]
+        segments = [
+            {
+                "chunk_index": 1,
+                "local_speaker": "A",
+                "speaker_id": "speaker_host",
+                "speaker_id_source": "voice",
+                "text": "Welcome back.",
+            },
+            {
+                "chunk_index": 1,
+                "local_speaker": "B",
+                "speaker_id": "speaker_ad",
+                "speaker_id_source": "voice",
+                "text": "This episode is brought to you by a sponsor.",
+            },
+        ]
+
+        merged_segments, merged_speakers, debug = ytranslate.collapse_role_speaker_identities(
+            segments,
+            speakers,
+        )
+
+        self.assertEqual([segment["speaker_id"] for segment in merged_segments], ["speaker_host", "speaker_ad"])
+        self.assertIn("speaker_ad", {speaker["id"] for speaker in merged_speakers})
+        self.assertEqual(debug["merged_role_speakers"], {})
+
     def test_voice_reconciliation_keeps_baseline_on_low_margin_match(self):
         segments = [
             {"chunk_index": 1, "local_speaker": "A", "speaker": "A", "start": 0, "end": 8, "text": "Alice anchor."},
@@ -601,6 +1296,7 @@ class RunTranslationJobSourceChoiceTests(unittest.TestCase):
                 "os.environ",
                 {"OPENAI_API_KEY": "test-openai", "YOUTUBE_API_KEY": "test-youtube"},
             ),
+            patch.object(ytranslate, "OUTPUT_DIR", "/tmp"),
             patch.object(ytranslate, "fetch_video_metadata", return_value={"title": "Video", "description": ""}),
             patch.object(ytranslate, "fetch_transcript", return_value=transcript_info),
             patch.object(ytranslate, "transcribe_youtube_audio_with_openai", return_value=asr_result) as asr_mock,
@@ -612,6 +1308,7 @@ class RunTranslationJobSourceChoiceTests(unittest.TestCase):
                 side_effect=lambda _url, _video_id, segments, _speaker_mapping, _log: (segments, {"status": "test"}),
             ),
             patch.object(ytranslate, "translate_attributed_turns", side_effect=fake_translate),
+            patch.object(ytranslate, "render_source_pdf", return_value="/tmp/Video_EN.pdf"),
             patch.object(ytranslate, "render_docx") as render_mock,
             patch.object(ytranslate, "convert_docx_to_pdf", return_value="/tmp/video.pdf"),
             patch.object(ytranslate, "send_completion_notification"),
@@ -637,6 +1334,24 @@ class RunTranslationJobSourceChoiceTests(unittest.TestCase):
         mapping_mock.assert_called_once()
         rendered_turns = render_mock.call_args.args[2]
         self.assertEqual(rendered_turns[0]["speaker_id"], "speaker_asr")
+
+    def test_job_returns_english_pdf_alongside_translated_outputs(self):
+        transcript_info = {
+            "is_generated": True,
+            "segments": [
+                {"start": 0, "duration": 1, "text": "speakerless caption"},
+            ],
+        }
+
+        result, _asr_mock, _mapping_mock, _render_mock = self.run_with_common_mocks(
+            transcript_info
+        )
+
+        self.assertEqual(result["english_pdf_path"], "/tmp/Video_EN.pdf")
+        self.assertEqual(
+            result["output_files"],
+            ["/tmp/Video.docx", "/tmp/video.pdf", "/tmp/Video_EN.pdf"],
+        )
 
     def test_low_quality_asr_applies_speaker_mapping_overrides(self):
         transcript_info = {

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -12,7 +13,7 @@ import time
 import unicodedata
 import inspect
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -49,7 +50,7 @@ OPENAI_ASR_TRANSPORT = "curl"
 DOCX_FONT_NAME = "Arial"
 DOCX_FONT_SIZE = Pt(13)
 DOCX_HEADING_FONT_SIZE = Pt(16)
-OUTPUT_DIR = os.path.expanduser("~/Downloads")
+OUTPUT_DIR = os.path.expanduser(os.getenv("YTRANSLATE_OUTPUT_DIR", "~/Downloads"))
 CACHE_DIR = os.path.expanduser("~/Library/Caches/ytranslate")
 SPEAKER_OVERRIDES_FILENAME = "speaker-overrides.json"
 TURN_TEXT_PASS_MAX_CHARS = 6_000
@@ -63,6 +64,48 @@ VOICE_RECONCILIATION_MIN_ANCHOR_SECONDS = 5.0
 VOICE_RECONCILIATION_MAX_ANCHOR_SEGMENTS = 28
 VOICE_RECONCILIATION_LOCAL_MAJORITY_SHARE = 0.78
 VOICE_RECONCILIATION_LOCAL_MAJORITY_MIN_SEGMENTS = 2
+SPEAKER_IDENTITY_LINKER_MODEL = os.getenv(
+    "YTRANSLATE_SPEAKER_IDENTITY_LINKER_MODEL", "gpt-5.6-luna"
+)
+SPEAKER_IDENTITY_LINKER_REASONING_EFFORT = "low"
+SPEAKER_IDENTITY_LINKER_BATCH_SEGMENTS = 300
+SPEAKER_IDENTITY_LINKER_CONTEXT_SEGMENTS = 12
+SPEAKER_IDENTITY_LINKER_CACHE_SCHEMA_VERSION = 1
+ROLE_SPEAKER_LABEL_MARKERS = (
+    "ad read",
+    "advertisement",
+    "sponsor read",
+    "sponsor",
+    "commercial",
+)
+VOICE_DERIVED_SPEAKER_SOURCES = {"voice", "voice_neighbor", "voice_local_majority"}
+ALL_IN_CHANNEL_TITLES = {"all-in podcast", "all in podcast"}
+ALL_IN_KNOWN_SPEAKERS = [
+    {
+        "id": "speaker_jason_calacanis",
+        "label_short": "Jason",
+        "label_full": "Jason Calacanis",
+        "aliases": ["jason", "j-cal", "jcal", "j cal"],
+    },
+    {
+        "id": "speaker_chamath_palihapitiya",
+        "label_short": "Chamath",
+        "label_full": "Chamath Palihapitiya",
+        "aliases": ["chamath", "chumath", "jamath"],
+    },
+    {
+        "id": "speaker_david_sacks",
+        "label_short": "Sacks",
+        "label_full": "David Sacks",
+        "aliases": ["sacks", "zach", "sachs", "david sacks"],
+    },
+    {
+        "id": "speaker_david_friedberg",
+        "label_short": "Friedberg",
+        "label_full": "David Friedberg",
+        "aliases": ["friedberg", "freeberg", "freiberg", "david friedberg"],
+    },
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -156,6 +199,22 @@ def canonicalize_youtube_url(url: str) -> Optional[str]:
     return f"https://youtu.be/{video_id}"
 
 
+def metadata_from_youtube_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    snippet = item.get("snippet", {})
+    tags = snippet.get("tags") or []
+    if not isinstance(tags, list):
+        tags = []
+    return {
+        "title": snippet.get("title", ""),
+        "description": snippet.get("description", ""),
+        "channelTitle": snippet.get("channelTitle"),
+        "channelId": snippet.get("channelId"),
+        "tags": [str(tag) for tag in tags],
+        "defaultLanguage": snippet.get("defaultLanguage"),
+        "defaultAudioLanguage": snippet.get("defaultAudioLanguage"),
+    }
+
+
 def fetch_video_metadata(video_id: str, api_key: str) -> Dict[str, Any]:
     params = {
         "part": "snippet",
@@ -179,13 +238,41 @@ def fetch_video_metadata(video_id: str, api_key: str) -> Dict[str, Any]:
     if not items:
         raise RuntimeError("No video metadata found (invalid video ID?)")
 
-    snippet = items[0].get("snippet", {})
+    return metadata_from_youtube_item(items[0])
+
+
+def normalize_identity_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii").lower()
+    return re.sub(r"[^a-z0-9]+", " ", ascii_text).strip()
+
+
+def speaker_public_fields(speaker: Dict[str, Any]) -> Dict[str, str]:
+    speaker_id = str(speaker.get("id") or speaker_id_from_label(str(speaker.get("label_short") or "speaker")))
+    label_short = str(speaker.get("label_short") or speaker_id)
+    label_full = str(speaker.get("label_full") or label_short)
     return {
-        "title": snippet.get("title", ""),
-        "description": snippet.get("description", ""),
-        "defaultLanguage": snippet.get("defaultLanguage"),
-        "defaultAudioLanguage": snippet.get("defaultAudioLanguage"),
+        "id": speaker_id,
+        "label_short": label_short,
+        "label_full": label_full,
     }
+
+
+def infer_known_speaker_roster(metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    channel_title = normalize_identity_text(str(metadata.get("channelTitle") or ""))
+    tags = [normalize_identity_text(str(tag)) for tag in metadata.get("tags", [])]
+    tag_text = " ".join(tags)
+    is_all_in = (
+        channel_title in ALL_IN_CHANNEL_TITLES
+        or "all in podcast" in tag_text
+        or "jason calacanis" in tag_text
+        and "chamath" in tag_text
+        and "david sacks" in tag_text
+        and "david friedberg" in tag_text
+    )
+    if not is_all_in:
+        return []
+    return [dict(speaker) for speaker in ALL_IN_KNOWN_SPEAKERS]
 
 
 def pick_transcript(transcripts: List[Any], preferred_langs: List[str]) -> Any:
@@ -812,6 +899,377 @@ def build_local_speaker_profiles(
     return profiles
 
 
+def roster_speaker_by_alias(roster: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    by_alias: Dict[str, Dict[str, Any]] = {}
+    for speaker in roster:
+        aliases = [
+            speaker.get("label_short", ""),
+            speaker.get("label_full", ""),
+            *speaker.get("aliases", []),
+        ]
+        for alias in aliases:
+            normalized = normalize_identity_text(str(alias))
+            if normalized:
+                by_alias[normalized] = speaker
+    return by_alias
+
+
+def find_roster_mentions(text: str, roster: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+    normalized_text = f" {normalize_identity_text(text)} "
+    matches: List[Tuple[str, Dict[str, Any]]] = []
+    for alias, speaker in sorted(
+        roster_speaker_by_alias(roster).items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        if f" {alias} " in normalized_text:
+            matches.append((alias, speaker))
+    return matches
+
+
+def is_likely_handoff_phrase(text: str, alias: str) -> bool:
+    normalized = normalize_identity_text(text)
+    if alias not in normalized:
+        return False
+    handoff_markers = [
+        "what s your take",
+        "whats your take",
+        "what is your take",
+        "what do you think",
+        "your thoughts",
+        "do you worry",
+        "running your",
+        "curious to get your take",
+        "you want to add",
+        "as we wrap",
+        "how s this",
+        "how is this",
+    ]
+    alias_index = normalized.find(alias)
+    window = normalized[max(0, alias_index - 40): alias_index + len(alias) + 120]
+    return any(marker in window for marker in handoff_markers)
+
+
+def add_trusted_speaker_evidence(
+    trusted: Dict[Tuple[int, str], Dict[str, Any]],
+    key: Tuple[int, str],
+    speaker_id: str,
+    reason: str,
+    confidence: float,
+    text: str = "",
+) -> None:
+    existing = trusted.get(key)
+    if existing and float(existing.get("confidence") or 0) > confidence:
+        return
+    trusted[key] = {
+        "speaker_id": speaker_id,
+        "reason": reason,
+        "confidence": confidence,
+    }
+    if text:
+        trusted[key]["text"] = clean_segment_text(text)[:240]
+
+
+def find_next_response_segment(
+    segments: List[Dict[str, Any]],
+    start_index: int,
+    max_gap_seconds: float = 120.0,
+) -> Optional[Dict[str, Any]]:
+    current = segments[start_index]
+    current_chunk = int(current.get("chunk_index") or 0)
+    current_local = str(current.get("local_speaker") or current.get("speaker") or "speaker")
+    current_end = float(current.get("end") or current.get("start") or 0)
+    for candidate in segments[start_index + 1:]:
+        if int(candidate.get("chunk_index") or 0) != current_chunk:
+            return None
+        candidate_start = float(candidate.get("start") or 0)
+        if candidate_start - current_end > max_gap_seconds:
+            return None
+        candidate_local = str(candidate.get("local_speaker") or candidate.get("speaker") or "speaker")
+        if candidate_local == current_local:
+            continue
+        text = clean_segment_text(candidate.get("text", ""))
+        if len(text) < 4:
+            continue
+        return candidate
+    return None
+
+
+def starts_show_as_host(text: str) -> bool:
+    normalized = normalize_identity_text(text)
+    return any(
+        marker in normalized
+        for marker in [
+            "welcome back",
+            "all in podcast",
+            "number one podcast",
+            "besties are back",
+            "everybody s here",
+            "original quartet",
+        ]
+    )
+
+
+def is_likely_host_moderation_handoff(text: str) -> bool:
+    normalized = normalize_identity_text(text)
+    return any(
+        marker in normalized
+        for marker in [
+            "you want to add",
+            "as we wrap",
+            "i ll wrap",
+            "ill wrap",
+            "wrap up",
+        ]
+    )
+
+
+def speaker_by_full_name(roster: List[Dict[str, Any]], full_name: str) -> Optional[Dict[str, Any]]:
+    target = normalize_identity_text(full_name)
+    for speaker in roster:
+        if normalize_identity_text(str(speaker.get("label_full") or "")) == target:
+            return speaker
+    return None
+
+
+def build_direct_handoff_evidence(
+    segments: List[Dict[str, Any]],
+    roster: List[Dict[str, Any]],
+) -> Dict[Tuple[int, str], Dict[str, Any]]:
+    trusted: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    if not roster:
+        return trusted
+
+    sorted_segments = sorted(
+        segments,
+        key=lambda segment: (
+            float(segment.get("start") or 0),
+            int(segment.get("chunk_index") or 0),
+        ),
+    )
+    first_segment = next((segment for segment in sorted_segments if clean_segment_text(segment.get("text", ""))), None)
+    jason = speaker_by_full_name(roster, "Jason Calacanis")
+    if first_segment and jason and starts_show_as_host(first_segment.get("text", "")):
+        add_trusted_speaker_evidence(
+            trusted,
+            get_segment_local_key(first_segment),
+            str(jason["id"]),
+            "show-host-opening",
+            0.95,
+            str(first_segment.get("text") or ""),
+        )
+
+    for index, segment in enumerate(sorted_segments):
+        text = clean_segment_text(segment.get("text", ""))
+        if not text:
+            continue
+        for alias, speaker in find_roster_mentions(text, roster):
+            if not is_likely_handoff_phrase(text, alias):
+                continue
+            response = find_next_response_segment(sorted_segments, index)
+            if not response:
+                continue
+            add_trusted_speaker_evidence(
+                trusted,
+                get_segment_local_key(response),
+                str(speaker["id"]),
+                "direct-address-response",
+                0.98,
+                text,
+            )
+            jason = speaker_by_full_name(roster, "Jason Calacanis")
+            if jason and is_likely_host_moderation_handoff(text):
+                add_trusted_speaker_evidence(
+                    trusted,
+                    get_segment_local_key(segment),
+                    str(jason["id"]),
+                    "host-moderation-handoff",
+                    0.92,
+                    text,
+                )
+    return trusted
+
+
+def text_looks_like_sentence_continuation(previous_text: str, next_text: str) -> bool:
+    previous = clean_segment_text(previous_text)
+    following = clean_segment_text(next_text)
+    if not previous or not following:
+        return False
+    first_char = following[0]
+    if first_char.islower():
+        return True
+    if previous.endswith(("...", ",", ";", ":", "-", "—")):
+        return True
+    return False
+
+
+def build_boundary_continuity_evidence(
+    segments: List[Dict[str, Any]],
+    trusted_local_speakers: Dict[Tuple[int, str], Dict[str, Any]],
+    max_gap_seconds: float = 1.25,
+) -> Dict[Tuple[int, str], Dict[str, Any]]:
+    evidence: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    sorted_segments = sorted(
+        segments,
+        key=lambda segment: (
+            float(segment.get("start") or 0),
+            int(segment.get("chunk_index") or 0),
+        ),
+    )
+    for previous, current in zip(sorted_segments, sorted_segments[1:]):
+        previous_chunk = int(previous.get("chunk_index") or 0)
+        current_chunk = int(current.get("chunk_index") or 0)
+        if current_chunk != previous_chunk + 1:
+            continue
+        previous_key = get_segment_local_key(previous)
+        previous_evidence = trusted_local_speakers.get(previous_key)
+        if not previous_evidence:
+            continue
+        previous_end = float(previous.get("end") or previous.get("start") or 0)
+        current_start = float(current.get("start") or 0)
+        if abs(current_start - previous_end) > max_gap_seconds:
+            continue
+        if not text_looks_like_sentence_continuation(
+            str(previous.get("text") or ""),
+            str(current.get("text") or ""),
+        ):
+            continue
+        evidence[get_segment_local_key(current)] = {
+            "speaker_id": previous_evidence["speaker_id"],
+            "reason": "chunk-boundary-continuation",
+            "confidence": min(float(previous_evidence.get("confidence") or 0.9), 0.94),
+            "text": (
+                clean_segment_text(previous.get("text", ""))
+                + " / "
+                + clean_segment_text(current.get("text", ""))
+            )[:240],
+        }
+    return evidence
+
+
+def build_speaker_identity_evidence(
+    segments: List[Dict[str, Any]],
+    roster: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    trusted = build_direct_handoff_evidence(segments, roster)
+    boundary = build_boundary_continuity_evidence(segments, trusted)
+    for key, item in boundary.items():
+        add_trusted_speaker_evidence(
+            trusted,
+            key,
+            str(item["speaker_id"]),
+            str(item["reason"]),
+            float(item.get("confidence") or 0.9),
+            str(item.get("text") or ""),
+        )
+    return {
+        "speakers": [speaker_public_fields(speaker) for speaker in roster],
+        "trusted_local_speakers": trusted,
+    }
+
+
+def local_speaker_key_to_json(key: Tuple[int, str]) -> str:
+    return f"{int(key[0])}:{key[1]}"
+
+
+def serialize_speaker_identity_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "speakers": evidence.get("speakers", []),
+        "trusted_local_speakers": {
+            local_speaker_key_to_json(key): value
+            for key, value in evidence.get("trusted_local_speakers", {}).items()
+        },
+    }
+
+
+def speaker_identity_match_keys(speaker: Dict[str, Any]) -> List[str]:
+    keys = [
+        str(speaker.get("id") or ""),
+        str(speaker.get("label_short") or ""),
+        str(speaker.get("label_full") or ""),
+        *[str(alias) for alias in speaker.get("aliases", [])],
+    ]
+    return [normalize_identity_text(key) for key in keys if normalize_identity_text(key)]
+
+
+def apply_speaker_identity_evidence(
+    speaker_mapping: Dict[str, Any],
+    evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    evidence_speakers = [
+        speaker_public_fields(speaker)
+        for speaker in evidence.get("speakers", [])
+        if speaker.get("id")
+    ]
+    evidence_by_id = {speaker["id"]: speaker for speaker in evidence_speakers}
+    canonical_by_key: Dict[str, str] = {}
+    for raw_speaker, public_speaker in zip(evidence.get("speakers", []), evidence_speakers):
+        for key in speaker_identity_match_keys(raw_speaker):
+            canonical_by_key[key] = public_speaker["id"]
+        for key in speaker_identity_match_keys(public_speaker):
+            canonical_by_key[key] = public_speaker["id"]
+
+    existing_by_id = {
+        str(speaker.get("id")): speaker
+        for speaker in speaker_mapping.get("speakers", [])
+        if speaker.get("id")
+    }
+    model_id_to_canonical: Dict[str, str] = {}
+    kept_existing_speakers: Dict[str, Dict[str, str]] = {}
+    for speaker_id, speaker in existing_by_id.items():
+        canonical_id = None
+        for key in speaker_identity_match_keys(speaker):
+            canonical_id = canonical_by_key.get(key)
+            if canonical_id:
+                break
+        if canonical_id:
+            model_id_to_canonical[speaker_id] = canonical_id
+        else:
+            kept_existing_speakers[speaker_id] = speaker_public_fields(speaker)
+
+    local_speakers: List[Dict[str, Any]] = []
+    local_by_key: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    for item in speaker_mapping.get("local_speakers", []):
+        chunk_index = int(item.get("chunk_index") or 0)
+        local_speaker = str(item.get("local_speaker") or "speaker")
+        speaker_id = str(item.get("speaker_id") or "")
+        speaker_id = model_id_to_canonical.get(speaker_id, speaker_id)
+        copied = {
+            "chunk_index": chunk_index,
+            "local_speaker": local_speaker,
+            "speaker_id": speaker_id,
+        }
+        if item.get("speaker_id_source"):
+            copied["speaker_id_source"] = item["speaker_id_source"]
+        local_speakers.append(copied)
+        local_by_key[(chunk_index, local_speaker)] = copied
+
+    for key, item in evidence.get("trusted_local_speakers", {}).items():
+        chunk_index, local_speaker = key
+        target = local_by_key.get((int(chunk_index), str(local_speaker)))
+        if not target:
+            target = {
+                "chunk_index": int(chunk_index),
+                "local_speaker": str(local_speaker),
+                "speaker_id": "",
+            }
+            local_speakers.append(target)
+            local_by_key[(int(chunk_index), str(local_speaker))] = target
+        target["speaker_id"] = str(item.get("speaker_id") or target.get("speaker_id") or "")
+        target["speaker_id_source"] = str(item.get("reason") or "identity-evidence")
+
+    speakers: List[Dict[str, str]] = list(evidence_by_id.values())
+    speakers.extend(
+        speaker
+        for speaker_id, speaker in kept_existing_speakers.items()
+        if speaker_id not in evidence_by_id
+    )
+    return {
+        "speakers": speakers,
+        "local_speakers": local_speakers,
+    }
+
+
 def get_local_speaker_mapping_schema(profile_count: int) -> Dict[str, Any]:
     return {
         "type": "object",
@@ -868,12 +1326,18 @@ def build_local_speaker_mapping_user_prompt(
     description: str,
     profiles: List[Dict[str, Any]],
     source_language_hint: Optional[str],
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     lines = [
         f"Video URL: {url}",
         f"Title: {title}",
-        f"Description: {description}",
     ]
+    if metadata:
+        if metadata.get("channelTitle"):
+            lines.append(f"Channel title: {metadata.get('channelTitle')}")
+        if metadata.get("tags"):
+            lines.append("Tags: " + ", ".join(str(tag) for tag in metadata.get("tags", [])))
+    lines.append(f"Description: {description}")
     if source_language_hint:
         lines.append(f"Source language hint: {source_language_hint}")
     lines.append("")
@@ -897,6 +1361,7 @@ def assign_global_speakers_for_diarized_segments(
     segments: List[Dict[str, Any]],
     source_language_hint: Optional[str],
     debug_sink: Optional[List[Dict[str, Any]]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     profiles = build_local_speaker_profiles(segments)
     if not profiles:
@@ -911,6 +1376,7 @@ def assign_global_speakers_for_diarized_segments(
             description,
             profiles,
             source_language_hint,
+            metadata=metadata,
         ),
         schema_name="local_speaker_mapping",
         schema=get_local_speaker_mapping_schema(len(profiles)),
@@ -1314,33 +1780,152 @@ def reconcile_segment_speakers_with_voice_embeddings(
         segment["speaker_id_source"] = "voice_local_majority"
         debug["local_majority_assigned_count"] += 1
 
-    for index, segment in enumerate(resolved):
-        if segment.get("speaker_id_source") != "local_mapping":
-            continue
-        current_key = get_segment_local_key(segment)
-        current_start = float(segment.get("start") or 0)
-        previous = resolved[index - 1] if index > 0 else None
-        if previous and previous.get("speaker_id_source") in {"voice", "voice_neighbor"}:
-            previous_key = get_segment_local_key(previous)
-            previous_end = float(previous.get("end") or previous.get("start") or 0)
-            if previous_key == current_key and current_start - previous_end <= neighbor_gap_seconds:
-                segment["speaker_id"] = str(previous["speaker_id"])
-                segment["speaker_id_source"] = "voice_neighbor"
-                debug["neighbor_assigned_count"] += 1
+    propagating_voice_sources = {"voice", "voice_neighbor", "voice_local_majority"}
+    changed = True
+    while changed:
+        changed = False
+        for index, segment in enumerate(resolved):
+            if segment.get("speaker_id_source") != "local_mapping":
                 continue
+            current_key = get_segment_local_key(segment)
+            current_start = float(segment.get("start") or 0)
+            previous = resolved[index - 1] if index > 0 else None
+            if previous and previous.get("speaker_id_source") in propagating_voice_sources:
+                previous_key = get_segment_local_key(previous)
+                previous_end = float(previous.get("end") or previous.get("start") or 0)
+                if previous_key == current_key and current_start - previous_end <= neighbor_gap_seconds:
+                    segment["speaker_id"] = str(previous["speaker_id"])
+                    segment["speaker_id_source"] = "voice_neighbor"
+                    debug["neighbor_assigned_count"] += 1
+                    changed = True
+                    continue
 
-        next_segment = resolved[index + 1] if index + 1 < len(resolved) else None
-        if next_segment and next_segment.get("speaker_id_source") in {"voice", "voice_neighbor"}:
-            next_key = get_segment_local_key(next_segment)
-            current_end = float(segment.get("end") or segment.get("start") or 0)
-            next_start = float(next_segment.get("start") or 0)
-            if next_key == current_key and next_start - current_end <= neighbor_gap_seconds:
-                segment["speaker_id"] = str(next_segment["speaker_id"])
-                segment["speaker_id_source"] = "voice_neighbor"
-                debug["neighbor_assigned_count"] += 1
+            next_segment = resolved[index + 1] if index + 1 < len(resolved) else None
+            if next_segment and next_segment.get("speaker_id_source") in propagating_voice_sources:
+                next_key = get_segment_local_key(next_segment)
+                current_end = float(segment.get("end") or segment.get("start") or 0)
+                next_start = float(next_segment.get("start") or 0)
+                if next_key == current_key and next_start - current_end <= neighbor_gap_seconds:
+                    segment["speaker_id"] = str(next_segment["speaker_id"])
+                    segment["speaker_id_source"] = "voice_neighbor"
+                    debug["neighbor_assigned_count"] += 1
+                    changed = True
 
     debug["speaker_count"] = len(speakers_by_id)
     return resolved, debug
+
+
+def segment_duration_or_unit(segment: Dict[str, Any]) -> float:
+    start = segment.get("start")
+    end = segment.get("end")
+    try:
+        if start is not None and end is not None:
+            duration = float(end) - float(start)
+            if duration > 0:
+                return duration
+    except (TypeError, ValueError):
+        pass
+    return 1.0
+
+
+def is_role_like_speaker(speaker: Dict[str, str]) -> bool:
+    label = normalize_identity_text(
+        " ".join(
+            [
+                str(speaker.get("id") or ""),
+                str(speaker.get("label_short") or ""),
+                str(speaker.get("label_full") or ""),
+            ]
+        )
+    )
+    return any(marker in label for marker in ROLE_SPEAKER_LABEL_MARKERS)
+
+
+def collapse_role_speaker_identities(
+    segments: List[Dict[str, Any]],
+    speakers: List[Dict[str, str]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]], Dict[str, Any]]:
+    role_speaker_ids = {
+        str(speaker.get("id"))
+        for speaker in speakers
+        if speaker.get("id") and is_role_like_speaker(speaker)
+    }
+    real_speaker_ids = {
+        str(speaker.get("id"))
+        for speaker in speakers
+        if speaker.get("id") and str(speaker.get("id")) not in role_speaker_ids
+    }
+    debug: Dict[str, Any] = {
+        "role_speaker_ids": sorted(role_speaker_ids),
+        "merged_role_speakers": {},
+        "candidate_scores": {},
+        "changed_segment_count": 0,
+    }
+    if not role_speaker_ids or not real_speaker_ids:
+        return [dict(segment) for segment in segments], list(speakers), debug
+
+    groups: Dict[Any, List[Dict[str, Any]]] = {}
+    for segment in segments:
+        groups.setdefault(get_segment_local_key(segment), []).append(segment)
+
+    candidate_scores: Dict[str, Dict[str, float]] = {role_id: {} for role_id in role_speaker_ids}
+    for group_segments in groups.values():
+        group_role_ids = {
+            str(segment.get("speaker_id") or "")
+            for segment in group_segments
+            if str(segment.get("speaker_id") or "") in role_speaker_ids
+        }
+        if not group_role_ids:
+            continue
+        for segment in group_segments:
+            speaker_id = str(segment.get("speaker_id") or "")
+            if speaker_id not in real_speaker_ids:
+                continue
+            if segment.get("speaker_id_source") not in VOICE_DERIVED_SPEAKER_SOURCES:
+                continue
+            weight = segment_duration_or_unit(segment)
+            for role_id in group_role_ids:
+                candidate_scores[role_id][speaker_id] = candidate_scores[role_id].get(speaker_id, 0.0) + weight
+
+    merge_by_role: Dict[str, str] = {}
+    for role_id, scores in candidate_scores.items():
+        if not scores:
+            continue
+        target_id, score = max(scores.items(), key=lambda item: item[1])
+        if score <= 0:
+            continue
+        merge_by_role[role_id] = target_id
+
+    debug["candidate_scores"] = {
+        role_id: {speaker_id: round(score, 3) for speaker_id, score in scores.items()}
+        for role_id, scores in candidate_scores.items()
+        if scores
+    }
+    debug["merged_role_speakers"] = dict(merge_by_role)
+    if not merge_by_role:
+        return [dict(segment) for segment in segments], list(speakers), debug
+
+    merged_segments: List[Dict[str, Any]] = []
+    changed_segment_count = 0
+    for segment in segments:
+        copied = dict(segment)
+        speaker_id = str(copied.get("speaker_id") or "")
+        target_id = merge_by_role.get(speaker_id)
+        if target_id:
+            copied["speaker_id_before_role_merge"] = speaker_id
+            copied["speaker_id"] = target_id
+            copied["speaker_id_source_before_role_merge"] = copied.get("speaker_id_source")
+            copied["speaker_id_source"] = "role_identity_merge"
+            changed_segment_count += 1
+        merged_segments.append(copied)
+
+    merged_speakers = [
+        speaker
+        for speaker in speakers
+        if str(speaker.get("id") or "") not in merge_by_role
+    ]
+    debug["changed_segment_count"] = changed_segment_count
+    return merged_segments, merged_speakers, debug
 
 
 def get_voice_reconciliation_enabled() -> bool:
@@ -1461,6 +2046,423 @@ def reconcile_diarized_segments_with_voice(
         return resolved, {"status": "skipped", "error": str(exc)}
 
 
+def get_speaker_identity_linker_enabled() -> bool:
+    raw = os.getenv("YTRANSLATE_SPEAKER_IDENTITY_LINKER", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def speaker_identity_boundary_schema(segment_count: int) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "boundaries": {
+                "type": "array",
+                "minItems": segment_count,
+                "maxItems": segment_count,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "segment_id": {"type": "integer"},
+                        "boundary_before": {
+                            "type": "string",
+                            "enum": ["same", "uncertain", "change"],
+                        },
+                    },
+                    "required": ["segment_id", "boundary_before"],
+                },
+            }
+        },
+        "required": ["boundaries"],
+    }
+
+
+def speaker_identity_boundary_system_prompt() -> str:
+    return (
+        "Detect anonymous speaker-turn boundaries in an ASR transcript. Do not identify or name speakers. "
+        "For every TARGET segment, classify whether the same real person continues from the immediately "
+        "preceding transcript segment: 'same' means confidently the same person, 'change' means confidently "
+        "a different person starts, and 'uncertain' means the evidence is insufficient. Local diarizer labels "
+        "are weak hints and can both merge two people and split one uninterrupted speaker. Use grammar, sentence "
+        "continuity, overlapping timestamps, direct address, question-answer flow, interruptions, and discourse. "
+        "Use 'same' or 'change' only when confident because they become clustering constraints; otherwise choose "
+        "'uncertain'. Return each TARGET segment exactly once with its exact segment_id."
+    )
+
+
+def speaker_identity_boundary_batches(
+    segment_count: int,
+    batch_size: int = SPEAKER_IDENTITY_LINKER_BATCH_SEGMENTS,
+    context_size: int = SPEAKER_IDENTITY_LINKER_CONTEXT_SEGMENTS,
+) -> List[Tuple[range, range]]:
+    batches: List[Tuple[range, range]] = []
+    for start in range(0, segment_count, batch_size):
+        stop = min(segment_count, start + batch_size)
+        context_start = max(0, start - context_size)
+        context_stop = min(segment_count, stop + context_size)
+        batches.append((range(start, stop), range(context_start, context_stop)))
+    return batches
+
+
+def speaker_identity_boundary_user_prompt(
+    title: str,
+    context: str,
+    segments: List[Dict[str, Any]],
+    target_ids: range,
+    context_ids: range,
+) -> str:
+    target_set = set(target_ids)
+    lines = [
+        f"Title: {title}",
+        f"Context: {context}",
+        "",
+        "Transcript. Classify TARGET lines only; BEFORE and AFTER are context:",
+    ]
+    for segment_id in context_ids:
+        segment = segments[segment_id]
+        if segment_id in target_set:
+            marker = "TARGET"
+        elif segment_id < target_ids.start:
+            marker = "BEFORE"
+        else:
+            marker = "AFTER"
+        chunk_index, local_speaker = get_segment_local_key(segment)
+        start = float(segment.get("start") or 0)
+        end = float(segment.get("end") or start)
+        lines.append(
+            f"{marker} {segment_id} | {start:.3f}-{end:.3f} | "
+            f"local={chunk_index}/{local_speaker} | "
+            f"text={clean_segment_text(str(segment.get('text') or ''))}"
+        )
+    return "\n".join(lines)
+
+
+def validate_speaker_identity_boundaries(
+    assignments: List[Dict[str, Any]],
+    target_ids: range,
+) -> Dict[int, str]:
+    expected = set(target_ids)
+    result: Dict[int, str] = {}
+    for assignment in assignments:
+        segment_id = int(assignment.get("segment_id"))
+        boundary = str(assignment.get("boundary_before") or "")
+        if segment_id in result:
+            raise RuntimeError(f"Duplicate boundary result for segment {segment_id}")
+        if boundary not in {"same", "uncertain", "change"}:
+            raise RuntimeError(f"Invalid boundary value {boundary!r} for segment {segment_id}")
+        result[segment_id] = boundary
+    if set(result) != expected:
+        missing = sorted(expected - set(result))
+        extra = sorted(set(result) - expected)
+        raise RuntimeError(
+            f"Boundary IDs mismatch; missing={missing[:10]}, extra={extra[:10]}"
+        )
+    return result
+
+
+def infer_speaker_identity_boundaries(
+    client: OpenAI,
+    video_id: str,
+    title: str,
+    context: str,
+    segments: List[Dict[str, Any]],
+    log: Callable[[str], None],
+) -> Tuple[List[str], Dict[str, Any]]:
+    if not segments:
+        return [], {"status": "skipped", "reason": "no-segments"}
+
+    boundaries = ["uncertain"] * len(segments)
+    boundaries[0] = "change"
+    batches = speaker_identity_boundary_batches(len(segments))
+    batch_dir = os.path.join(
+        get_video_cache_dir(video_id),
+        "speaker-identity-linker",
+        "boundary-batches",
+        SPEAKER_IDENTITY_LINKER_REASONING_EFFORT,
+    )
+    os.makedirs(batch_dir, exist_ok=True)
+    cache_hits = 0
+    requests = 0
+    for batch_number, (target_ids, context_ids) in enumerate(batches, 1):
+        schema = speaker_identity_boundary_schema(len(target_ids))
+        system_prompt = speaker_identity_boundary_system_prompt()
+        user_prompt = speaker_identity_boundary_user_prompt(
+            title,
+            context,
+            segments,
+            target_ids,
+            context_ids,
+        )
+        digest_payload = {
+            "schema_version": SPEAKER_IDENTITY_LINKER_CACHE_SCHEMA_VERSION,
+            "model": SPEAKER_IDENTITY_LINKER_MODEL,
+            "reasoning_effort": SPEAKER_IDENTITY_LINKER_REASONING_EFFORT,
+            "schema": schema,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+        }
+        input_digest = hashlib.sha256(
+            json.dumps(
+                digest_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        batch_path = os.path.join(batch_dir, f"batch-{batch_number:02d}.json")
+        cached: Optional[Dict[str, Any]] = None
+        if os.path.exists(batch_path):
+            candidate = read_json_file(batch_path)
+            if (
+                candidate.get("schema_version")
+                == SPEAKER_IDENTITY_LINKER_CACHE_SCHEMA_VERSION
+                and candidate.get("input_digest") == input_digest
+            ):
+                cached = candidate
+        if cached is not None:
+            result = {"boundaries": cached.get("boundaries", [])}
+            cache_hits += 1
+        else:
+            log(
+                f"Speaker identity boundary batch {batch_number}/{len(batches)} "
+                f"({len(target_ids)} segments)..."
+            )
+            result = call_openai_with_retry(
+                client,
+                SPEAKER_IDENTITY_LINKER_MODEL,
+                system_prompt,
+                user_prompt,
+                schema_name=f"speaker_identity_boundaries_{batch_number}",
+                schema=schema,
+                reasoning_effort=SPEAKER_IDENTITY_LINKER_REASONING_EFFORT,
+            )
+            requests += 1
+            write_json_file(
+                batch_path,
+                {
+                    "schema_version": SPEAKER_IDENTITY_LINKER_CACHE_SCHEMA_VERSION,
+                    "input_digest": input_digest,
+                    "boundaries": result.get("boundaries", []),
+                },
+            )
+        validated = validate_speaker_identity_boundaries(
+            list(result.get("boundaries", [])),
+            target_ids,
+        )
+        for segment_id, boundary in validated.items():
+            boundaries[segment_id] = boundary
+    boundaries[0] = "change"
+    counts = {value: boundaries.count(value) for value in ("same", "uncertain", "change")}
+    return boundaries, {
+        "status": "ok",
+        "model": SPEAKER_IDENTITY_LINKER_MODEL,
+        "reasoning_effort": SPEAKER_IDENTITY_LINKER_REASONING_EFFORT,
+        "batch_count": len(batches),
+        "cache_hits": cache_hits,
+        "request_count": requests,
+        "boundary_counts": counts,
+    }
+
+
+def attach_speaker_labels_to_segments(
+    segments: List[Dict[str, Any]],
+    speakers: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    labels_by_id = {
+        str(speaker.get("id") or ""): str(
+            speaker.get("label_full")
+            or speaker.get("label_short")
+            or speaker.get("id")
+            or ""
+        )
+        for speaker in speakers
+        if speaker.get("id")
+    }
+    resolved: List[Dict[str, Any]] = []
+    for segment in segments:
+        copied = dict(segment)
+        speaker_id = str(copied.get("speaker_id") or "")
+        if speaker_id in labels_by_id:
+            copied["speaker_label"] = labels_by_id[speaker_id]
+        resolved.append(copied)
+    return resolved
+
+
+def merge_linked_speakers(
+    speakers: List[Dict[str, Any]],
+    segments: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    merged = {
+        str(speaker.get("id") or ""): dict(speaker)
+        for speaker in speakers
+        if speaker.get("id")
+    }
+    for segment in segments:
+        speaker_id = str(segment.get("speaker_id") or "").strip()
+        speaker_label = str(segment.get("speaker_label") or "").strip()
+        if not speaker_id or not speaker_label:
+            continue
+        merged.setdefault(
+            speaker_id,
+            {
+                "id": speaker_id,
+                "label_short": speaker_label,
+                "label_full": speaker_label,
+            },
+        )
+    return list(merged.values())
+
+
+def normalize_linked_speaker_ids(
+    segments: List[Dict[str, Any]],
+    speakers: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    try:
+        from speaker_identity_linker import canonical_speaker_name
+    except ImportError:
+        return [dict(segment) for segment in segments]
+
+    ids_by_identity: Dict[str, str] = {}
+    for speaker in speakers:
+        speaker_id = str(speaker.get("id") or "").strip()
+        label = str(
+            speaker.get("label_full")
+            or speaker.get("label_short")
+            or speaker_id
+        )
+        if speaker_id:
+            ids_by_identity.setdefault(canonical_speaker_name(label), speaker_id)
+
+    normalized: List[Dict[str, Any]] = []
+    for segment in segments:
+        copied = dict(segment)
+        label = str(copied.get("speaker_label") or copied.get("speaker_id") or "")
+        target_id = ids_by_identity.get(canonical_speaker_name(label))
+        current_id = str(copied.get("speaker_id") or "")
+        if target_id and target_id != current_id:
+            copied["speaker_id_before_identity_normalization"] = current_id
+            copied["speaker_id"] = target_id
+        normalized.append(copied)
+    return normalized
+
+
+def run_speaker_identity_linker(
+    client: OpenAI,
+    url: str,
+    video_id: str,
+    metadata: Dict[str, Any],
+    segments: List[Dict[str, Any]],
+    speakers: List[Dict[str, Any]],
+    log: Callable[[str], None],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    baseline = attach_speaker_labels_to_segments(segments, speakers)
+    if not get_speaker_identity_linker_enabled():
+        return baseline, list(speakers), {"status": "disabled"}
+    if not infer_known_speaker_roster(metadata):
+        return baseline, list(speakers), {
+            "status": "skipped",
+            "reason": "unsupported-show",
+        }
+    if len(speakers) < 2 or not baseline:
+        return baseline, list(speakers), {
+            "status": "skipped",
+            "reason": "insufficient-speakers-or-segments",
+        }
+
+    try:
+        import soundfile as sf
+        from resemblyzer import VoiceEncoder
+
+        import speaker_identity_linker as linker
+        from all_in_speaker_reference_bank import ALL_IN_REFERENCE_BANK
+
+        source_audio_path = download_youtube_audio(url, video_id, log)
+        wav_path = transcode_audio_for_voice_reconciliation(
+            source_audio_path,
+            video_id,
+            log,
+        )
+        audio, sample_rate = sf.read(wav_path, dtype="float32")
+        if getattr(audio, "ndim", 1) > 1:
+            audio = audio.mean(axis=1)
+        if int(sample_rate) != 16000:
+            raise RuntimeError(f"Expected 16000 Hz linker audio, got {sample_rate}")
+
+        encoder = VoiceEncoder()
+        references, reference_debug = linker.build_episode_reference_centroids(
+            baseline,
+            audio,
+            int(sample_rate),
+            encoder,
+            dict(ALL_IN_REFERENCE_BANK.get("speakers", {})),
+            active_speaker_labels=[
+                str(
+                    speaker.get("label_full")
+                    or speaker.get("label_short")
+                    or speaker.get("id")
+                    or ""
+                )
+                for speaker in speakers
+                if linker.canonical_speaker_name(
+                    speaker.get("label_full")
+                    or speaker.get("label_short")
+                    or speaker.get("id")
+                )
+                not in {"jason", "chamath", "sacks", "friedberg"}
+            ],
+        )
+        if len(references) < 2:
+            raise RuntimeError("Fewer than two active speaker voice references")
+
+        active_labels = ", ".join(
+            str(speaker.get("label_full") or speaker.get("label_short") or "")
+            for speaker in speakers
+            if speaker.get("id")
+        )
+        context = (
+            f"Channel: {metadata.get('channelTitle') or 'All-In Podcast'}. "
+            f"Candidate panel identities from prior attribution: {active_labels}."
+        )
+        boundaries, boundary_debug = infer_speaker_identity_boundaries(
+            client,
+            video_id,
+            str(metadata.get("title") or "Untitled"),
+            context,
+            baseline,
+            log,
+        )
+        resolved, linker_debug = linker.link_speaker_identities(
+            baseline,
+            boundaries,
+            audio,
+            int(sample_rate),
+            encoder,
+            references,
+            log=log,
+        )
+        resolved = normalize_linked_speaker_ids(resolved, speakers)
+        merged_speakers = merge_linked_speakers(speakers, resolved)
+        changed_count = sum(
+            str(before.get("speaker_id") or "") != str(after.get("speaker_id") or "")
+            for before, after in zip(baseline, resolved)
+        )
+        debug = {
+            "status": "ok",
+            "scope": "recognized-all-in",
+            "changed_segment_count": changed_count,
+            "reference_bank_schema_version": ALL_IN_REFERENCE_BANK.get("schema_version"),
+            "references": reference_debug,
+            "boundaries": boundary_debug,
+            "linker": linker_debug,
+        }
+        log(f"Speaker identity linker changed {changed_count} segments.")
+        return resolved, merged_speakers, debug
+    except Exception as exc:
+        log(f"Speaker identity linker skipped ({exc}).")
+        return baseline, list(speakers), {"status": "skipped", "error": str(exc)}
+
+
 def attributed_turns_from_diarized_segments(
     segments: List[Dict[str, Any]],
     speaker_mapping: Optional[Dict[str, Any]] = None,
@@ -1509,6 +2511,81 @@ def attributed_turns_from_diarized_segments(
         "speakers": list(speakers_by_id.values()),
         "turns": turns,
     }
+
+
+def aliases_for_speaker_label(label_short: str, label_full: str) -> List[str]:
+    labels = [label_short, label_full]
+    normalized_full = normalize_identity_text(label_full)
+    normalized_short = normalize_identity_text(label_short)
+    if "friedberg" in normalized_full or "friedberg" in normalized_short:
+        labels.extend(["Friedberg", "Freeberg", "Freiberg"])
+    if "sacks" in normalized_full or "sacks" in normalized_short:
+        labels.extend(["Sacks", "Sachs", "Zach"])
+    if "chamath" in normalized_full or "chamath" in normalized_short:
+        labels.extend(["Chamath", "Chumath", "Jamath"])
+    if "jason" in normalized_full or "jason" in normalized_short:
+        labels.extend(["Jason", "J-Cal", "JCal", "J Cal"])
+    seen = set()
+    aliases = []
+    for label in labels:
+        normalized = normalize_identity_text(label)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            aliases.append(normalized)
+    return aliases
+
+
+def text_contains_self_reference_contradiction(text: str, alias: str) -> bool:
+    normalized = normalize_identity_text(text)
+    if not alias or f" {alias} " not in f" {normalized} ":
+        return False
+    patterns = [
+        f"what {alias} said",
+        f"{alias} said",
+        f"{alias} says",
+        f"to {alias} s point",
+        f"{alias} s point",
+        f"{alias} is right",
+        f"{alias} was right",
+        f"{alias} you",
+        f"{alias} what",
+    ]
+    return any(pattern in normalized for pattern in patterns)
+
+
+def find_speaker_identity_contradictions(
+    speakers: List[Dict[str, str]],
+    turns: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    speakers_by_id = {
+        str(speaker.get("id")): speaker
+        for speaker in speakers
+        if speaker.get("id")
+    }
+    issues: List[Dict[str, Any]] = []
+    for index, turn in enumerate(turns, 1):
+        speaker_id = str(turn.get("speaker_id") or "")
+        speaker = speakers_by_id.get(speaker_id)
+        if not speaker:
+            continue
+        text = clean_segment_text(turn.get("text_source") or turn.get("text_translated") or "")
+        for alias in aliases_for_speaker_label(
+            str(speaker.get("label_short") or ""),
+            str(speaker.get("label_full") or ""),
+        ):
+            if not text_contains_self_reference_contradiction(text, alias):
+                continue
+            issues.append(
+                {
+                    "turn_index": index,
+                    "speaker_id": speaker_id,
+                    "speaker_label": speaker.get("label_short") or speaker_id,
+                    "matched_alias": alias,
+                    "text": text[:240],
+                }
+            )
+            break
+    return issues
 
 
 def transcribe_youtube_audio_with_openai(
@@ -1718,13 +2795,45 @@ def render_markdown_transcript(
     for turn in turns:
         speaker_id = turn.get("speaker_id")
         label = speaker_labels.get(speaker_id) or speaker_id or "Speaker"
-        text = (turn.get("text_translated") or "").strip()
+        speaker = next((item for item in speakers if item.get("id") == speaker_id), {})
+        text = strip_redundant_speaker_prefix(
+            turn.get("text_translated") or "",
+            label,
+            speaker,
+        )
         if not text:
             continue
         lines.append(f"**{label}:** {text}")
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def strip_redundant_speaker_prefix(
+    text: str,
+    rendered_label: str,
+    speaker: Optional[Dict[str, str]] = None,
+) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    labels = [
+        rendered_label,
+        (speaker or {}).get("label_short", ""),
+        (speaker or {}).get("label_full", ""),
+        (speaker or {}).get("id", ""),
+    ]
+    seen = set()
+    for label in sorted(labels, key=lambda value: len(value or ""), reverse=True):
+        label = (label or "").strip()
+        key = label.lower()
+        if not label or key in seen:
+            continue
+        seen.add(key)
+        match = re.match(rf"^\s*{re.escape(label)}\s*[:：-]\s*(.+)$", cleaned, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    return cleaned
 
 
 def build_target_terminology_guidance(target_language: str) -> str:
@@ -1952,6 +3061,7 @@ def call_openai(
     schema_name: str = "translated_transcript",
     schema: Optional[Dict[str, Any]] = None,
     temperature: Optional[float] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> Dict[str, Any]:
     if schema is None:
         raise RuntimeError("OpenAI JSON schema must be provided")
@@ -1970,14 +3080,19 @@ def call_openai(
         "schema": schema,
     }
 
-    response_kwargs = {
+    response_kwargs: Dict[str, Any] = {
         "model": model,
-        "temperature": OPENAI_TEMPERATURE if temperature is None else temperature,
         "input": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     }
+    if reasoning_effort is None:
+        response_kwargs["temperature"] = (
+            OPENAI_TEMPERATURE if temperature is None else temperature
+        )
+    else:
+        response_kwargs["reasoning"] = {"effort": reasoning_effort}
 
     params = inspect.signature(client.responses.create).parameters
     if "response_format" in params:
@@ -2006,6 +3121,7 @@ def call_openai_with_retry(
     schema_name: str = "translated_transcript",
     schema: Optional[Dict[str, Any]] = None,
     temperature: Optional[float] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> Dict[str, Any]:
     delay = 1.0
     for attempt in range(max_retries):
@@ -2018,6 +3134,7 @@ def call_openai_with_retry(
                 schema_name=schema_name,
                 schema=schema,
                 temperature=temperature,
+                reasoning_effort=reasoning_effort,
             )
         except Exception as exc:
             is_rate_limit = isinstance(exc, getattr(openai, "RateLimitError", ()))
@@ -2446,21 +3563,56 @@ def render_docx(
 
     for turn in turns:
         speaker_id = turn.get("speaker_id")
-        text = (turn.get("text_translated") or "").strip()
-        if not text:
-            continue
         label = None
+        speaker = None
         for sp in speakers:
             if sp.get("id") == speaker_id:
                 label = sp.get("label_short") or sp.get("id")
+                speaker = sp
                 break
         label = label or speaker_id or "Speaker"
+        text = strip_redundant_speaker_prefix(
+            turn.get("text_translated") or "",
+            label,
+            speaker,
+        )
+        if not text:
+            continue
         para = doc.add_paragraph()
         run = para.add_run(f"{label}: ")
         run.bold = True
         para.add_run(text)
 
     doc.save(output_path)
+
+
+def render_source_pdf(
+    title: str,
+    speakers: List[Dict[str, str]],
+    turns: List[Dict[str, str]],
+    output_dir: str,
+) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    base_name = f"{sanitize_filename(title)}_EN"
+    temporary_docx_path = os.path.join(output_dir, f"{base_name}.docx")
+    source_turns = [
+        {
+            **turn,
+            "text_translated": turn.get("text_source") or "",
+        }
+        for turn in turns
+    ]
+    try:
+        render_docx(
+            title,
+            speakers,
+            source_turns,
+            temporary_docx_path,
+        )
+        return convert_docx_to_pdf(temporary_docx_path)
+    finally:
+        if os.path.exists(temporary_docx_path):
+            os.remove(temporary_docx_path)
 
 
 def convert_docx_to_pdf(docx_path: str) -> str:
@@ -2680,7 +3832,10 @@ def run_translation_job(
     asr_result: Optional[Dict[str, Any]] = None
     speaker_mapping: Optional[Dict[str, Any]] = None
     voice_reconciliation_debug: Optional[Dict[str, Any]] = None
+    speaker_identity_linker_debug: Optional[Dict[str, Any]] = None
     resolved_asr_segments: Optional[List[Dict[str, Any]]] = None
+    speaker_identity_evidence: Optional[Dict[str, Any]] = None
+    speaker_identity_contradictions: List[Dict[str, Any]] = []
     if transcript_info is not None and is_high_quality_youtube_transcript(transcript_info):
         log("Using manual speaker-labeled YouTube transcript.")
         transcript_source = "youtube_speaker_labeled"
@@ -2705,11 +3860,32 @@ def run_translation_job(
             asr_result.get("segments", []),
             source_language_hint,
             debug_sink=speaker_pass_debug if debug else None,
+            metadata=metadata,
         )
+        model_speaker_mapping = speaker_mapping
+        known_speaker_roster = infer_known_speaker_roster(metadata)
+        if known_speaker_roster:
+            log("Applying speaker identity evidence from metadata and dialogue handoffs...")
+            speaker_identity_evidence = build_speaker_identity_evidence(
+                asr_result.get("segments", []),
+                known_speaker_roster,
+            )
+            speaker_mapping = apply_speaker_identity_evidence(
+                speaker_mapping,
+                speaker_identity_evidence,
+            )
         speaker_overrides = load_speaker_mapping_overrides(video_id)
         if speaker_overrides:
             log("Applying speaker mapping overrides...")
             speaker_mapping = apply_speaker_mapping_overrides(speaker_mapping, speaker_overrides)
+        cache_dir = get_video_cache_dir(video_id)
+        write_json_file(os.path.join(cache_dir, "speaker-mapping-model.json"), model_speaker_mapping)
+        if speaker_identity_evidence is not None:
+            write_json_file(
+                os.path.join(cache_dir, "speaker-identity-evidence.json"),
+                serialize_speaker_identity_evidence(speaker_identity_evidence),
+            )
+        write_json_file(os.path.join(cache_dir, "speaker-mapping-effective.json"), speaker_mapping)
         log("Refining ASR speaker identities with voice matching...")
         resolved_asr_segments, voice_reconciliation_debug = reconcile_diarized_segments_with_voice(
             canonical_url,
@@ -2718,10 +3894,66 @@ def run_translation_job(
             speaker_mapping,
             log,
         )
+        resolved_asr_segments, effective_speakers, role_merge_debug = collapse_role_speaker_identities(
+            resolved_asr_segments,
+            speaker_mapping.get("speakers", []),
+        )
+        if role_merge_debug.get("merged_role_speakers"):
+            log(
+                "Merged role-like speaker identities into voice-matched speakers: "
+                + ", ".join(
+                    f"{role_id}->{target_id}"
+                    for role_id, target_id in role_merge_debug["merged_role_speakers"].items()
+                )
+            )
+        if isinstance(voice_reconciliation_debug, dict):
+            voice_reconciliation_debug["role_speaker_identity_merge"] = role_merge_debug
+        log("Linking stable speaker identities across the episode...")
+        (
+            resolved_asr_segments,
+            effective_speakers,
+            speaker_identity_linker_debug,
+        ) = run_speaker_identity_linker(
+            client,
+            canonical_url,
+            video_id,
+            metadata,
+            resolved_asr_segments,
+            effective_speakers,
+            log,
+        )
+        speaker_mapping_for_turns = dict(speaker_mapping)
+        speaker_mapping_for_turns["speakers"] = effective_speakers
         attributed = attributed_turns_from_diarized_segments(
             resolved_asr_segments,
-            speaker_mapping,
+            speaker_mapping_for_turns,
         )
+        speaker_identity_contradictions = find_speaker_identity_contradictions(
+            attributed.get("speakers", []),
+            attributed.get("turns", []),
+        )
+        write_json_file(
+            os.path.join(cache_dir, "openai-asr-resolved-segments.json"),
+            resolved_asr_segments,
+        )
+        write_json_file(
+            os.path.join(cache_dir, "voice-speaker-reconciliation.json"),
+            voice_reconciliation_debug,
+        )
+        write_json_file(
+            os.path.join(cache_dir, "speaker-identity-linker.json"),
+            speaker_identity_linker_debug,
+        )
+        write_json_file(os.path.join(cache_dir, "source-attributed-turns.json"), attributed)
+        write_json_file(
+            os.path.join(cache_dir, "speaker-identity-contradictions.json"),
+            speaker_identity_contradictions,
+        )
+        if speaker_identity_contradictions:
+            log(
+                "Speaker identity contradiction check found "
+                f"{len(speaker_identity_contradictions)} possible issue(s)."
+            )
 
     if not attributed.get("turns"):
         raise RuntimeError("Transcript source produced no attributed turns.")
@@ -2737,10 +3969,25 @@ def run_translation_job(
             )
         if speaker_mapping is not None:
             write_json_file(os.path.join(debug_dir, "speaker-mapping.json"), speaker_mapping)
+        if speaker_identity_evidence is not None:
+            write_json_file(
+                os.path.join(debug_dir, "speaker-identity-evidence.json"),
+                serialize_speaker_identity_evidence(speaker_identity_evidence),
+            )
         if voice_reconciliation_debug is not None:
             write_json_file(
                 os.path.join(debug_dir, "voice-speaker-reconciliation.json"),
                 voice_reconciliation_debug,
+            )
+        if speaker_identity_linker_debug is not None:
+            write_json_file(
+                os.path.join(debug_dir, "speaker-identity-linker.json"),
+                speaker_identity_linker_debug,
+            )
+        if speaker_identity_contradictions:
+            write_json_file(
+                os.path.join(debug_dir, "speaker-identity-contradictions.json"),
+                speaker_identity_contradictions,
             )
         if speaker_pass_debug:
             for idx, item in enumerate(speaker_pass_debug, 1):
@@ -2749,6 +3996,20 @@ def run_translation_job(
                     item,
                 )
         log(f"Wrote transcript debug artifacts to {debug_dir}")
+
+    english_pdf_path: Optional[str] = None
+    if not debug_dir:
+        log("Rendering English source transcript PDF...")
+        try:
+            english_pdf_path = render_source_pdf(
+                title,
+                attributed.get("speakers", []),
+                attributed.get("turns", []),
+                OUTPUT_DIR,
+            )
+            log(f"Saved English transcript PDF to {english_pdf_path}")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to generate English transcript PDF: {exc}") from exc
 
     log("Translating attributed turns...")
     result = translate_attributed_turns(
@@ -2868,6 +4129,8 @@ def run_translation_job(
         raise RuntimeError(f"Failed to generate transcript PDF: {exc}") from exc
 
     output_files = [output_path, pdf_path]
+    if english_pdf_path:
+        output_files.append(english_pdf_path)
     send_completion_notification(
         "Translation completed: " + ", ".join(os.path.basename(p) for p in output_files)
     )
@@ -2880,6 +4143,7 @@ def run_translation_job(
         "target_language": resolved_target_language,
         "docx_path": output_path,
         "pdf_path": pdf_path,
+        "english_pdf_path": english_pdf_path,
         "output_files": output_files,
     }
 

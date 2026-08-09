@@ -76,7 +76,7 @@ Then open a YouTube watch page. A compact `PDF` button is injected to the left o
 
 The server:
 - prints logs to the terminal when run manually
-- saves `.docx` and `.pdf` to `~/Downloads/`
+- saves the translated `.docx` and `.pdf`, plus an English source `_EN.pdf`, to `~/Downloads/`
 - shows a macOS desktop notification on completion
 - uses the status page as the progress and failure surface
 
@@ -126,6 +126,8 @@ OPENAI_API_KEY=...
 YOUTUBE_API_KEY=...
 OPENAI_MODEL=gpt-5.4-mini
 OPENAI_ASR_MODEL=gpt-4o-transcribe-diarize
+YTRANSLATE_SPEAKER_IDENTITY_LINKER=1
+YTRANSLATE_SPEAKER_IDENTITY_LINKER_MODEL=gpt-5.6-luna
 DEFAULT_TARGET_LANGUAGE=Russian
 ```
 
@@ -139,6 +141,11 @@ PDF is also generated alongside it:
 <video-title>.pdf
 ```
 
+The speaker-attributed English source transcript is generated as PDF only:
+```
+<video-title>_EN.pdf
+```
+
 Debug mode writes a per-run folder under `~/Downloads/`, for example:
 ```
 ytranslate-debug-<video-id>-<timestamp>-<video-title>/
@@ -149,6 +156,7 @@ Artifacts include:
 - `youtube-transcript.json` and `youtube-normalized-transcript.md` when a YouTube transcript is available
 - `openai-asr.json` when OpenAI diarized ASR is used
 - `speaker-mapping*.json` when ASR chunk-local speakers are reconciled globally
+- `speaker-identity-linker.json` when the production All-In identity linker runs
 - `source-attributed-turns.json`
 - `translation-pass-*.json`
 - `cleanup-pass-*.json` (when Russian cleanup runs)
@@ -174,6 +182,8 @@ export YOUTUBE_API_KEY=\"...\"
 - Each ASR chunk has request-level retries and the job can make later passes over only the chunks that failed. Tune with `OPENAI_ASR_MAX_RETRIES`, `OPENAI_ASR_MAX_PASSES`, and `OPENAI_ASR_RETRY_PASS_DELAY_SECONDS`.
 - ASR requests use a separate timeout from text-generation calls. The default is 600 seconds per chunk attempt; override with `OPENAI_ASR_TIMEOUT_SECONDS`.
 - Metadata (title/description) is fetched via the official YouTube Data API to help infer speakers.
+- Recognized All-In episodes run an episode-wide speaker identity linker after the existing mapping, voice reconciliation, and role-merge stages. A low-effort Luna pass supplies anonymous `same`/`uncertain`/`change` boundary hints; local Resemblyzer embeddings attach the reviewed host/recurring-guest voice references and conservatively enroll one-off guests. Sustained low-similarity runs can become `Unknown/External` instead of being forced onto a host.
+- Speaker identity boundary batches are hash-validated and cached under `~/Library/Caches/ytranslate/<video-id>/speaker-identity-linker/`. Set `YTRANSLATE_SPEAKER_IDENTITY_LINKER=0` to disable this stage. Any linker error is fallback-safe: the pre-linker speaker attribution is retained.
 - The Chrome extension talks to `http://127.0.0.1:8765`.
 - The status page at `http://127.0.0.1:8765/` shows the latest job, recent jobs, pipeline steps, ASR chunk progress, output paths, and recent events.
 - The extension displays YouTube-style bottom-left toast notifications for request feedback.
