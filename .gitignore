@@ -9,3 +9,7 @@ frontend/node_modules/
 experiments/asr_compare/output/
 experiments/speaker_audit/output/
 experiments/deepgram_compare/output/
+experiments/gpt_transcribe_eval/output/
+experiments/luna_text_pipeline_eval/output/
+experiments/turn_constrained_diarization/output/
+/output/

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>All-In Speaker Attribution Lab</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Speaker identity linker experiment</p>
+        <h1>All-In Speaker Attribution Lab</h1>
+      </div>
+      <div class="run-state" id="run-state">Loading results</div>
+    </header>
+
+    <main>
+      <section class="controls" aria-label="Playback and review controls">
+        <div class="control-row">
+          <label class="field episode-field">
+            <span>Episode</span>
+            <select id="episode-select"></select>
+          </label>
+          <div class="mode-switch" role="group" aria-label="Row filter">
+            <button class="mode-button active" type="button" data-mode="all">All</button>
+            <button class="mode-button" type="button" data-mode="disagreements">Disagreements</button>
+          </div>
+          <label class="field search-field">
+            <span>Search transcript</span>
+            <input id="search-input" type="search" autocomplete="off" placeholder="Name or phrase">
+          </label>
+          <label class="check-field">
+            <input id="follow-toggle" type="checkbox" checked>
+            <span>Follow audio</span>
+          </label>
+        </div>
+        <div class="player-row">
+          <button id="back-button" class="icon-button" type="button" title="Back 10 seconds" aria-label="Back 10 seconds">−10</button>
+          <audio id="audio" controls preload="metadata"></audio>
+          <button id="forward-button" class="icon-button" type="button" title="Forward 10 seconds" aria-label="Forward 10 seconds">+10</button>
+          <output id="time-output" class="time-output">00:00:00 / 00:00:00</output>
+          <form id="jump-form" class="jump-form">
+            <label for="jump-input">Jump</label>
+            <input id="jump-input" inputmode="numeric" placeholder="00:18:30" aria-label="Jump to time">
+            <button type="submit">Go</button>
+          </form>
+        </div>
+      </section>
+
+      <section class="score-strip" id="score-strip" aria-label="Episode result summary"></section>
+
+      <section class="comparison-shell" aria-label="Synchronized transcript comparison">
+        <div class="comparison-grid comparison-head" id="comparison-head"></div>
+        <div id="comparison-body"></div>
+        <div class="empty-state" id="empty-state" hidden>No transcript rows match this view.</div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
